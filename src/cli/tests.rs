@@ -679,7 +679,7 @@ fn stats_reads_the_volume_holding_the_cache() {
     let mut config = crate::test_support::test_config(dir.path().join("cache"));
     std::fs::create_dir_all(&config.cache_dir).unwrap();
     config.auto_recover_min_free_bytes = 1;
-    let volume = volume_view(&config).expect("Unix reads volume usage");
+    let volume = volume_view(&config, None).expect("Unix reads volume usage");
     assert!(volume.total_bytes > 0, "{volume:?}");
     assert!(volume.free_bytes <= volume.total_bytes, "{volume:?}");
     assert_eq!(volume.recovery_floor_bytes, 1);
@@ -693,23 +693,26 @@ fn the_volume_row_says_what_is_free_and_whether_recovery_is_on() {
         free: free * gib,
     };
     assert_eq!(
-        row_text(volume_row(&VolumeView::new(usage(2), 0))),
+        row_text(volume_row(&VolumeView::new(usage(2), 0, true))),
         "Volume | 2.0 GiB free | of 100.0 GiB · 98% used · free-space recovery off"
     );
-    let below = VolumeView::new(usage(2), 10 * gib);
+    let below = VolumeView::new(usage(2), 10 * gib, false);
     assert!(below.below_floor);
     assert_eq!(
         row_text(volume_row(&below)),
-        "Volume | 2.0 GiB free | of 100.0 GiB · 98% used · below the 10.0 GiB recovery floor"
+        "Volume | 2.0 GiB free | of 100.0 GiB · 98% used · below the 10.0 GiB recovery floor · cache only"
     );
-    let above = VolumeView::new(usage(40), 10 * gib);
+    let above = VolumeView::new(usage(40), 10 * gib, true);
     assert!(!above.below_floor);
     assert!(
-        row_text(volume_row(&above)).ends_with("60% used · recovery keeps 10.0 GiB free"),
+        row_text(volume_row(&above))
+            .ends_with("60% used · recovery keeps 10.0 GiB free · cache and idle targets"),
         "{above:?}"
     );
-    // An unset floor is never "below".
-    assert!(!VolumeView::new(usage(0), 0).below_floor);
+    // An unset floor is never "below", and recovers nothing.
+    let off = VolumeView::new(usage(0), 0, true);
+    assert!(!off.below_floor);
+    assert!(!off.recovers_targets);
 }
 
 #[test]
@@ -3642,6 +3645,7 @@ fn save_manifest_config(
         auto_share_target_files: false,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
+        auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
         target_liveness: false,
@@ -4671,6 +4675,8 @@ fn effective_config_like(config: &Config) -> crate::daemon::EffectiveConfig {
         remote_key_cache_refresh_secs: config.remote_key_cache_refresh_secs,
         socket_path: config.socket_path().display().to_string(),
         started_at_ms: 1_700_000_000_000,
+        auto_recover_min_free_bytes: None,
+        auto_recover_targets: None,
     }
 }
 
@@ -7395,6 +7401,7 @@ fn target_rows_report_each_worktree_and_sort_by_what_frees_most() {
         let mut pressure = config.clone();
         pressure.auto_recover_min_free_bytes =
             kache_fs::volume_usage(&targets[0].1).unwrap().total - 1;
+        pressure.auto_recover_targets = true;
         let empty_workspace = dir.path().join("wt/empty");
         let empty_target = dir.path().join("targets/empty");
         std::fs::create_dir_all(&empty_workspace).unwrap();
@@ -8662,4 +8669,167 @@ fn unit_cleanup_confirmation_requires_candidates_and_nonpreview_mode() {
             "preview={preview} units={units}"
         );
     }
+}
+
+#[test]
+fn init_adds_target_recovery_without_rewriting_the_config() {
+    assert_eq!(
+        enable_target_recovery("").as_deref(),
+        Some("[cache]\nauto_recover_targets = true\n")
+    );
+    let commented = "# my settings\n[cache]\nlocal_max_size = \"50G\" # keep\n";
+    assert_eq!(
+        enable_target_recovery(commented).as_deref(),
+        Some(
+            "# my settings\n[cache]\nauto_recover_targets = true\nlocal_max_size = \"50G\" # keep\n"
+        )
+    );
+    assert_eq!(
+        enable_target_recovery("[remote]\nbucket = \"b\"").as_deref(),
+        Some("[remote]\nbucket = \"b\"\n\n[cache]\nauto_recover_targets = true\n")
+    );
+    // A table spelled another way is not edited blind.
+    assert_eq!(
+        enable_target_recovery("cache.local_max_size = \"5G\"\n"),
+        None
+    );
+    assert_eq!(enable_target_recovery("[cache] # mine\n"), None);
+
+    assert!(!sets_target_recovery(""));
+    assert!(!sets_target_recovery("[cache]\nlocal_max_size = \"5G\"\n"));
+    assert!(sets_target_recovery(
+        "[cache]\nauto_recover_targets = false\n"
+    ));
+    assert!(sets_target_recovery("cache.auto_recover_targets = true\n"));
+}
+
+#[test]
+fn init_offers_recovery_with_the_floor_its_file_and_environment_set() {
+    let none = |_: &str| None;
+    let defaults = RecoverySettings::of("", &none, false);
+    assert_eq!(defaults.floor, crate::config::DEFAULT_RECOVERY_FLOOR);
+    assert_eq!(defaults.targets_from_env, None);
+    assert!(!defaults.file_decides_targets);
+    assert_eq!(RecoverySettings::of("", &none, true).floor, 0, "CI default");
+
+    let file = "[cache]\nauto_recover_min_free_bytes = 107374182400\n";
+    assert_eq!(RecoverySettings::of(file, &none, false).floor, 100 << 30);
+    let env = |name: &str| match name {
+        "KACHE_AUTO_RECOVER_MIN_FREE_BYTES" => Some("5368709120".to_string()),
+        "KACHE_AUTO_RECOVER_TARGETS" => Some("0".to_string()),
+        _ => None,
+    };
+    let overridden = RecoverySettings::of(file, &env, false);
+    assert_eq!(overridden.floor, 5 << 30, "the environment wins");
+    assert_eq!(overridden.targets_from_env, Some(false));
+    for (value, on) in [("1", true), ("TRUE", true), ("yes", false)] {
+        let env =
+            move |name: &str| (name == "KACHE_AUTO_RECOVER_TARGETS").then(|| value.to_string());
+        assert_eq!(
+            RecoverySettings::of("", &env, false).targets_from_env,
+            Some(on),
+            "{value}"
+        );
+    }
+    let ignored = RecoverySettings::of(&format!("{file}ignore_env = true\n"), &env, false);
+    assert_eq!(ignored.floor, 100 << 30, "unless the file ignores it");
+    assert_eq!(ignored.targets_from_env, None);
+    assert!(
+        RecoverySettings::of("[cache]\nauto_recover_targets = false\n", &none, false)
+            .file_decides_targets
+    );
+}
+
+#[test]
+fn stats_shows_the_recovery_the_daemon_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = crate::test_support::test_config(dir.path().to_path_buf());
+    config.auto_recover_min_free_bytes = 1;
+    config.auto_recover_targets = false;
+    assert_eq!(recovery_in_effect(&config, None), (1, false));
+    let mut daemon = effective_config_like(&config);
+    daemon.auto_recover_min_free_bytes = Some(7);
+    daemon.auto_recover_targets = Some(true);
+    assert_eq!(recovery_in_effect(&config, Some(&daemon)), (7, true));
+    // A daemon from before the fields: this process's settings.
+    daemon.auto_recover_targets = None;
+    assert_eq!(recovery_in_effect(&config, Some(&daemon)), (1, false));
+}
+
+#[test]
+fn init_asks_only_when_nothing_else_decides() {
+    let settings = |floor, env, file| RecoverySettings {
+        floor,
+        targets_from_env: env,
+        file_decides_targets: file,
+    };
+    let gib = 1u64 << 30;
+    assert_eq!(
+        recovery_offer(&settings(gib, None, false), false),
+        RecoveryOffer::Ask(gib)
+    );
+    assert_eq!(
+        recovery_offer(&settings(gib, None, false), true),
+        RecoveryOffer::Explain(gib)
+    );
+    assert_eq!(
+        recovery_offer(&settings(gib, None, true), false),
+        RecoveryOffer::Nothing
+    );
+    assert_eq!(
+        recovery_offer(&settings(0, None, false), false),
+        RecoveryOffer::Nothing
+    );
+    assert_eq!(
+        recovery_offer(&settings(gib, Some(true), true), false),
+        RecoveryOffer::FromEnv(true),
+        "the environment overrides the file"
+    );
+    assert_eq!(
+        recovery_offer(&settings(0, Some(false), false), true),
+        RecoveryOffer::FromEnv(false)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn init_saves_target_recovery_safely() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kache/config.toml");
+    assert_eq!(read_config_text(&path).unwrap(), "", "no file yet");
+    assert!(save_target_recovery(&path, "").unwrap());
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "[cache]\nauto_recover_targets = true\n"
+    );
+
+    // A file holding credentials keeps its permissions.
+    let text = "[cache]\nlocal_max_size = \"5G\"\n";
+    std::fs::write(&path, text).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(save_target_recovery(&path, text).unwrap());
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("auto_recover_targets = true")
+    );
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    // Edited while the question waited: nothing is written.
+    std::fs::write(&path, "[cache]\nlocal_max_size = \"9G\"\n").unwrap();
+    assert!(!save_target_recovery(&path, text).unwrap());
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "[cache]\nlocal_max_size = \"9G\"\n"
+    );
+    // A table it cannot edit blind: nothing is written.
+    std::fs::write(&path, "cache.local_max_size = \"5G\"\n").unwrap();
+    assert!(!save_target_recovery(&path, "cache.local_max_size = \"5G\"\n").unwrap());
+
+    // An unreadable path is an error, not an empty file.
+    assert!(read_config_text(dir.path()).is_err());
 }

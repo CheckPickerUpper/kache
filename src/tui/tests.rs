@@ -126,6 +126,7 @@ fn test_config() -> Config {
         auto_share_target_files: false,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
+        auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
         target_liveness: false,
@@ -251,6 +252,8 @@ fn tui_uses_the_daemon_remote_status() {
             remote_key_cache_refresh_secs: 60,
             socket_path: "/shared/daemon.sock".to_string(),
             started_at_ms: 1,
+            auto_recover_min_free_bytes: None,
+            auto_recover_targets: None,
         }),
         ..StatsSnapshot::default()
     };
@@ -1547,6 +1550,8 @@ fn store_names_the_daemon_and_now_leaves_the_version_off() {
         remote_key_cache_refresh_secs: 60,
         socket_path: "/daemon.sock".to_string(),
         started_at_ms: 1,
+        auto_recover_min_free_bytes: None,
+        auto_recover_targets: None,
     });
 
     let now = rendered_tab(&mut state, Tab::Now);
