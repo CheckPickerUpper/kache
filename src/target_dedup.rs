@@ -434,7 +434,6 @@ fn resolve_roots(config: &Config, paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
         return Ok(roots);
     }
     let store = crate::store::Store::open(config)?;
-    crate::worktree_discovery::discover(&store)?;
     tracked_roots(&store)
 }
 
