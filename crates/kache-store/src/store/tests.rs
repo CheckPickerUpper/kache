@@ -5324,6 +5324,187 @@ fn test_store_clear() {
     assert!(!store.contains("k1"));
 }
 
+/// A tagged Cargo target directory at `target`.
+fn tagged_target(target: &Path) {
+    std::fs::create_dir_all(target.join("debug")).unwrap();
+    std::fs::write(
+        target.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55",
+    )
+    .unwrap();
+}
+
+#[test]
+fn clearing_the_store_keeps_tracked_target_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let workspace = dir.path().join("workspace");
+    tagged_target(&workspace.join("target"));
+    store
+        .remember_target_root(&workspace.join("target"), &workspace)
+        .unwrap();
+    store.clear().unwrap();
+    assert_eq!(store.tracked_target_roots(0).unwrap().len(), 1);
+}
+
+#[test]
+fn a_target_named_through_a_deleted_worktree_stays_tracked() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let root = std::path::absolute(dir.path()).unwrap();
+    let worktree = root.join("worktree");
+    let shared = root.join("shared");
+    std::fs::create_dir_all(&worktree).unwrap();
+    tagged_target(&shared);
+    store
+        .remember_target_root(&worktree.join("../shared"), &worktree)
+        .unwrap();
+    std::fs::remove_dir_all(&worktree).unwrap();
+    let rows = store.tracked_target_roots(0).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].path, shared);
+}
+
+/// A row recorded before paths were normalized names the same directory
+/// through `..`; the next build's row replaces it, so cleanup never judges the
+/// directory by the stale one.
+#[test]
+fn a_build_replaces_an_older_spelling_of_the_same_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let root = std::path::absolute(dir.path()).unwrap();
+    let shared = root.join("shared");
+    let worktree = root.join("wt");
+    tagged_target(&shared);
+    std::fs::create_dir_all(&worktree).unwrap();
+    store.remember_target_root(&shared, &worktree).unwrap();
+    let old = worktree.join("../shared");
+    store
+        .db
+        .execute(
+            "UPDATE target_roots SET path = ?1, last_seen = last_seen - 86400",
+            [old.to_string_lossy()],
+        )
+        .unwrap();
+
+    store.remember_target_root(&shared, &worktree).unwrap();
+    let rows = store.tracked_target_roots(0).unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].path, shared);
+}
+
+/// A registration inside a caller's transaction joins it rather than
+/// starting its own, so the caller's rollback undoes it.
+#[test]
+fn a_registration_joins_the_callers_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let workspace = dir.path().join("workspace");
+    let target = workspace.join("target");
+    tagged_target(&target);
+    store.db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    store.remember_target_root(&target, &workspace).unwrap();
+    store.db.execute_batch("ROLLBACK").unwrap();
+    assert!(store.tracked_target_roots(0).unwrap().is_empty());
+    store.remember_target_root(&target, &workspace).unwrap();
+    assert!(store.db.is_autocommit(), "no transaction left open");
+    assert_eq!(store.tracked_target_roots(0).unwrap().len(), 1);
+
+    // Forgetting a removed directory joins a caller's transaction the same way.
+    let identity = crate::filesystem::directory_identity(&target).unwrap();
+    std::fs::remove_dir_all(&target).unwrap();
+    store.db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    store.forget_target_roots_with_identity(identity).unwrap();
+    store.db.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(store.tracked_target_roots(0).unwrap().len(), 1);
+    store.forget_target_roots_with_identity(identity).unwrap();
+    assert!(store.db.is_autocommit(), "no transaction left open");
+    assert!(store.tracked_target_roots(0).unwrap().is_empty());
+}
+
+/// A registration whose directory moved after its identity was read leaves
+/// other rows alone: that identity may belong to the directory's new path.
+#[test]
+fn a_moved_directory_does_not_drop_the_rows_of_its_new_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let root = std::path::absolute(dir.path()).unwrap();
+    let workspace = root.join("ws");
+    let old = workspace.join("target");
+    let new = root.join("moved/target");
+    tagged_target(&old);
+    let identity = crate::filesystem::directory_identity(&old).unwrap();
+    std::fs::create_dir_all(new.parent().unwrap()).unwrap();
+    std::fs::rename(&old, &new).unwrap();
+    store.remember_target_root(&new, &workspace).unwrap();
+
+    store
+        .record_target_root(&old, &workspace, identity, None)
+        .unwrap();
+    let paths: Vec<_> = store
+        .tracked_target_roots(0)
+        .unwrap()
+        .into_iter()
+        .map(|row| row.path)
+        .collect();
+    assert!(paths.contains(&new), "{paths:?}");
+}
+
+/// Forgetting a removed directory keeps a row whose path still exists: the
+/// filesystem may give a new directory the old inode.
+#[test]
+fn forgetting_by_identity_keeps_rows_whose_path_still_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let workspace = dir.path().join("workspace");
+    let target = workspace.join("target");
+    tagged_target(&target);
+    store.remember_target_root(&target, &workspace).unwrap();
+    let identity = crate::filesystem::directory_identity(&target).unwrap();
+    let gone = std::path::absolute(dir.path()).unwrap().join("gone/target");
+    store
+        .db
+        .execute(
+            "INSERT INTO target_roots
+                (path, workspace_root, first_seen, last_seen, device, inode, rustc, discovered)
+             SELECT ?1, workspace_root, first_seen, last_seen, device, inode, rustc, discovered
+             FROM target_roots",
+            [gone.to_string_lossy()],
+        )
+        .unwrap();
+
+    store.forget_target_roots_with_identity(identity).unwrap();
+    let rows = store.tracked_target_roots(0).unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].path, std::path::absolute(&target).unwrap());
+}
+
+#[test]
+fn forgetting_a_removed_target_matches_its_identity_not_its_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let workspace = dir.path().join("workspace");
+    let target = workspace.join("target");
+    tagged_target(&target);
+    store.remember_target_root(&target, &workspace).unwrap();
+    let removed = crate::filesystem::directory_identity(&target).unwrap();
+    store
+        .db
+        .execute("UPDATE target_roots SET path = 'another spelling'", [])
+        .unwrap();
+    // A build recorded a new directory at the removed path since.
+    let rebuilt = workspace.join("rebuilt");
+    tagged_target(&rebuilt);
+    std::fs::remove_dir_all(&target).unwrap();
+    std::fs::rename(&rebuilt, &target).unwrap();
+    store.remember_target_root(&target, &workspace).unwrap();
+
+    store.forget_target_roots_with_identity(removed).unwrap();
+    let rows = store.tracked_target_roots(0).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].path, std::path::absolute(&target).unwrap());
+}
+
 #[test]
 fn test_store_entry_dir() {
     let dir = tempfile::tempdir().unwrap();

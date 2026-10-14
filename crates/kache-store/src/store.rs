@@ -4470,8 +4470,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         if !crate::filesystem::target_root_is_safe(target, workspace_root) {
             return Ok(());
         }
-        let target = std::path::absolute(target)?;
-        let workspace_root = std::path::absolute(workspace_root)?;
+        let target = crate::filesystem::registry_path(target)?;
+        let workspace_root = crate::filesystem::registry_path(workspace_root)?;
         let Some(identity) = crate::filesystem::directory_identity(&target) else {
             return Ok(());
         };
@@ -4499,7 +4499,33 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         if fresh == Some(true) {
             return Ok(());
         }
-        let changed = self.db.execute(
+        // The row and the removal of its aliases commit together, so another
+        // registration cannot slip between them and lose its row to ours.
+        let in_transaction = !self.db.is_autocommit();
+        if !in_transaction {
+            self.db.execute_batch("BEGIN IMMEDIATE")?;
+        }
+        let written = self.record_target_root(&target, &workspace_root, identity, rustc);
+        if !in_transaction {
+            finish_transaction(&self.db, written.is_ok())?;
+        }
+        written
+    }
+
+    /// The upsert and alias cleanup of [`Self::remember_target_root_built_by`].
+    fn record_target_root(
+        &self,
+        target: &Path,
+        workspace_root: &Path,
+        identity: crate::filesystem::PathIdentity,
+        rustc: Option<&str>,
+    ) -> Result<()> {
+        // The directory may have been replaced or moved since its identity
+        // was read; a newer registration of it then wins.
+        if crate::filesystem::directory_identity(target) != Some(identity) {
+            return Ok(());
+        }
+        self.db.execute(
             "INSERT INTO target_roots
                 (path, workspace_root, first_seen, last_seen, device, inode, rustc, discovered)
              VALUES (?1, ?2, unixepoch(), unixepoch(), ?3, ?4, ?5, 0)
@@ -4524,32 +4550,32 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 rustc,
             ],
         )?;
-        if changed > 0 {
-            // Git may report a canonical /private path while Cargo used a
-            // /var or /tmp spelling of the same directory. The build row is
-            // authoritative; discard its discovered alias by inode.
-            self.db.execute(
-                "DELETE FROM target_roots
-                 WHERE path != ?1 AND device = ?2 AND inode = ?3 AND discovered != 0",
-                params![
-                    target.to_string_lossy(),
-                    identity.device.to_string(),
-                    identity.inode.to_string(),
-                ],
-            )?;
-            self.db.execute(
-                "DELETE FROM target_roots WHERE last_seen < unixepoch() - 15552000",
-                [],
-            )?;
-            self.db.execute(
-                "DELETE FROM target_roots WHERE path IN (
-                    SELECT path FROM target_roots
-                    ORDER BY discovered ASC, last_seen DESC, path ASC
-                    LIMIT -1 OFFSET 2048
-                )",
-                [],
-            )?;
-        }
+        // One row per directory. Git may report a canonical /private path
+        // while Cargo used a /var or /tmp spelling, and rows recorded before
+        // paths were normalized may spell it through `..`. The build row is
+        // authoritative; discard every alias by inode.
+        self.db.execute(
+            "DELETE FROM target_roots
+             WHERE path != ?1 AND device = ?2 AND inode = ?3",
+            params![
+                target.to_string_lossy(),
+                identity.device.to_string(),
+                identity.inode.to_string(),
+            ],
+        )?;
+        // A registration that got here wrote its row; prune the registry.
+        self.db.execute(
+            "DELETE FROM target_roots WHERE last_seen < unixepoch() - 15552000",
+            [],
+        )?;
+        self.db.execute(
+            "DELETE FROM target_roots WHERE path IN (
+                SELECT path FROM target_roots
+                ORDER BY discovered ASC, last_seen DESC, path ASC
+                LIMIT -1 OFFSET 2048
+            )",
+            [],
+        )?;
         Ok(())
     }
 
@@ -4564,8 +4590,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         if !crate::filesystem::target_root_is_safe(target, workspace_root) {
             return Ok(false);
         }
-        let target = std::path::absolute(target)?;
-        let workspace_root = std::path::absolute(workspace_root)?;
+        let target = crate::filesystem::registry_path(target)?;
+        let workspace_root = crate::filesystem::registry_path(workspace_root)?;
         let Some(identity) = crate::filesystem::directory_identity(&target) else {
             return Ok(false);
         };
@@ -4705,6 +4731,53 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             "DELETE FROM target_roots WHERE path = ?1",
             params![path.to_string_lossy()],
         )?;
+        Ok(())
+    }
+
+    /// Forget the rows that record the directory `identity` names, under any
+    /// spelling of its path, once a clean removed it. A row whose path still
+    /// exists stays: that is another directory, such as one a build created
+    /// since, that the filesystem gave the same inode.
+    pub fn forget_target_roots_with_identity(
+        &self,
+        identity: crate::filesystem::PathIdentity,
+    ) -> Result<()> {
+        self.refuse_write("forget a target root")?;
+        // Check and delete in one write transaction: a build that recreates
+        // the path either registered first, so the path exists and its row
+        // stays, or waits and records a fresh row after this one is gone.
+        let in_transaction = !self.db.is_autocommit();
+        if !in_transaction {
+            self.db.execute_batch("BEGIN IMMEDIATE")?;
+        }
+        let forgotten = self.forget_gone_rows_with_identity(identity);
+        if !in_transaction {
+            finish_transaction(&self.db, forgotten.is_ok())?;
+        }
+        forgotten
+    }
+
+    fn forget_gone_rows_with_identity(
+        &self,
+        identity: crate::filesystem::PathIdentity,
+    ) -> Result<()> {
+        let paths: Vec<String> = {
+            let mut stmt = self
+                .db
+                .prepare("SELECT path FROM target_roots WHERE device = ?1 AND inode = ?2")?;
+            stmt.query_map(
+                params![identity.device.to_string(), identity.inode.to_string()],
+                |row| row.get(0),
+            )?
+            .collect::<std::result::Result<_, _>>()?
+        };
+        for path in paths {
+            let gone = std::fs::symlink_metadata(&path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+            if gone {
+                self.forget_target_root_with_identity(Path::new(&path), identity)?;
+            }
+        }
         Ok(())
     }
 
@@ -6326,6 +6399,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     }
 
     /// Clear the entire store, including retained corrupt index copies.
+    /// Tracked target directories stay registered: they live outside the
+    /// store, and `kache clean` finds them through the registry.
     ///
     /// Index rows drop first, in one transaction: once it commits no
     /// reader can begin a restore from a purged entry, and the
@@ -6349,7 +6424,6 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             tx.execute("DELETE FROM entry_blobs", [])?;
             tx.execute("DELETE FROM blobs", [])?;
             tx.execute("DELETE FROM incremental_dirs", [])?;
-            tx.execute("DELETE FROM target_roots", [])?;
             tx.commit()?;
             Ok(())
         };
@@ -6616,5 +6690,18 @@ pub struct EntryInfo {
     pub content_hash: Option<String>,
 }
 
+/// Commit a transaction this code began, or roll it back. A failed `COMMIT`
+/// can leave it open, so that is rolled back too.
+fn finish_transaction(db: &rusqlite::Connection, succeeded: bool) -> Result<()> {
+    if !succeeded {
+        let _ = db.execute_batch("ROLLBACK");
+        return Ok(());
+    }
+    if let Err(error) = db.execute_batch("COMMIT") {
+        let _ = db.execute_batch("ROLLBACK");
+        return Err(error.into());
+    }
+    Ok(())
+}
 #[cfg(test)]
 mod tests;
