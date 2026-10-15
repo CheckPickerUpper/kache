@@ -24,7 +24,8 @@ fn doctor_link_layout_uses_the_mapped_store_and_leaves_missing_shards_absent() {
     Store::open(&config.for_volume_store(&mapping, |_| None)).unwrap();
     let mapped = doctor_link_layout(&config, &build);
     assert!(mapped.pass, "{}", mapped.detail);
-    assert!(mapped.detail.contains(&mapping.store.display().to_string()));
+    let store = crate::link_probe::shown_path(&mapping.store);
+    assert!(mapped.detail.contains(&store), "{}", mapped.detail);
     assert!(mapped.fix.is_none());
 
     config.volume_stores.clear();
@@ -33,7 +34,7 @@ fn doctor_link_layout_uses_the_mapped_store_and_leaves_missing_shards_absent() {
     assert!(
         unmapped
             .detail
-            .contains(&config.cache_dir.display().to_string())
+            .contains(&crate::link_probe::shown_path(&config.cache_dir))
     );
     let failed = doctor_link_layout(&config, &dir.path().join("absent-build"));
     assert!(!failed.pass);
@@ -9090,10 +9091,53 @@ fn a_declined_unit_clean_says_nothing_was_removed() {
 }
 
 #[test]
+fn command_lines_quote_for_the_platform_shell() {
+    let argv = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+    let windows_path = argv(&["kache", "clean", r"C:\Users\RUNNER~1\Temp\.tmp1", "--yes"]);
+    assert_eq!(
+        command_line(&windows_path, true),
+        r"kache clean C:\Users\RUNNER~1\Temp\.tmp1 --yes"
+    );
+    let spaced = argv(&["kache", "clean", r"C:\My Dir", r#"say "hi""#]);
+    assert_eq!(
+        command_line(&spaced, true),
+        r#"kache clean "C:\My Dir" "say \"hi\"""#
+    );
+    assert_eq!(command_line(&argv(&["kache", ""]), true), r#"kache """#);
+    assert_eq!(
+        command_line(&argv(&["kache", "clean", "/tmp/my dir"]), false),
+        "kache clean '/tmp/my dir'"
+    );
+}
+
+#[test]
+fn no_terminal_names_the_same_command_with_yes() {
+    let args = ["clean".to_string(), "/tmp/my dir".to_string()];
+    let quoted = if cfg!(windows) {
+        "\"/tmp/my dir\""
+    } else {
+        "'/tmp/my dir'"
+    };
+    assert_eq!(
+        no_terminal("nothing removed", &args, true).to_string(),
+        format!(
+            "nothing removed: there is no terminal to ask. Run `kache clean {quoted} --yes` \
+             to go ahead without asking, or --dry-run to preview."
+        )
+    );
+    assert_eq!(
+        no_terminal("init changed nothing", &["init".to_string()], false).to_string(),
+        "init changed nothing: there is no terminal to ask. Run `kache init --yes` to go ahead \
+         without asking."
+    );
+}
+
+#[test]
 fn removal_asks_only_at_a_terminal() {
     let never = |_: &str| -> Result<bool> { panic!("asked without a terminal") };
     assert!(confirm_removal_with("Remove?", true, false, never).unwrap());
-    assert!(!confirm_removal_with("Remove?", false, false, never).unwrap());
+    let refused = confirm_removal_with("Remove?", false, false, never).unwrap_err();
+    assert!(refused.to_string().contains("--yes"), "{refused}");
     assert!(confirm_removal_with("Remove?", false, true, |_| Ok(true)).unwrap());
     assert!(!confirm_removal_with("Remove?", false, true, |_| Ok(false)).unwrap());
 }
@@ -9693,6 +9737,223 @@ fn init_saves_target_recovery_safely() {
     assert!(read_config_text(dir.path()).is_err());
 }
 
+#[test]
+fn doctor_checks_the_cargo_wrapper_once_and_names_init() {
+    use crate::wrapper_config::WrapperSetting;
+    let config = std::path::Path::new("/home/me/.cargo/config.toml");
+    let (pass, detail, fix) = wrapper_check(None, Some(false), config);
+    assert!(!pass);
+    assert_eq!(detail, "not set");
+    let fix = fix.unwrap();
+    assert!(fix.contains("kache init"), "{fix}");
+    assert!(fix.contains("config.toml"), "{fix}");
+
+    let env = |value: &str| WrapperSetting::Environment {
+        value: value.into(),
+    };
+    assert_eq!(
+        wrapper_check(Some(&env("/bin/kache")), None, config),
+        (true, "kache via env".to_string(), None)
+    );
+    let (pass, detail, fix) = wrapper_check(Some(&env("sccache")), None, config);
+    assert!(!pass);
+    assert_eq!(detail, "sccache (sccache)");
+    assert!(fix.unwrap().contains("export RUSTC_WRAPPER=kache"));
+    let (_, detail, _) = wrapper_check(Some(&env("other")), None, config);
+    assert_eq!(detail, "other (not kache)");
+
+    let file = |value: &str| WrapperSetting::CargoConfig {
+        value: value.into(),
+        path: config.to_path_buf(),
+    };
+    let (pass, detail, fix) = wrapper_check(Some(&file("kache")), Some(false), config);
+    assert!(pass, "{detail}");
+    assert!(detail.starts_with("kache via "), "{detail}");
+    assert!(fix.is_none());
+    let fix_for = |repair| {
+        wrapper_check(Some(&file("sccache")), repair, config)
+            .2
+            .unwrap()
+    };
+    assert!(fix_for(Some(true)).contains("kache doctor --fix"));
+    assert!(fix_for(Some(true)).contains("kache init"));
+    assert!(!fix_for(Some(false)).contains("--fix"));
+    assert!(fix_for(Some(false)).contains("kache init"));
+    assert!(fix_for(None).starts_with("replace `rustc-wrapper = \"sccache\"`"));
+}
+
+#[test]
+fn doctor_suggests_the_running_binary_directory_for_path() {
+    let dir = std::path::Path::new("/opt/kache/bin");
+    assert_eq!(binary_fix(true, Some(dir)), None);
+    assert_eq!(
+        binary_fix(false, Some(dir)).as_deref(),
+        Some("add /opt/kache/bin to PATH")
+    );
+    let fallback = binary_fix(false, None).unwrap();
+    assert!(!fallback.contains("cargo install"), "{fallback}");
+}
+
+#[test]
+fn doctor_lists_volume_stores_under_storage_and_only_live_daemon_labels() {
+    assert_eq!(doctor_section("Volume store"), "Storage");
+    for label in DAEMON_CHECK_LABELS {
+        assert_eq!(doctor_section(label), "Services", "{label}");
+    }
+}
+
+#[test]
+fn init_preview_ends_with_the_flags_given_or_nothing_to_change() {
+    assert_eq!(
+        preview_end(true, false, false, false),
+        "Preview only. Run kache init to apply."
+    );
+    assert_eq!(
+        preview_end(true, true, true, true),
+        "Preview only. Run kache init --no-service --no-shell --yes to apply."
+    );
+    assert_eq!(
+        preview_end(true, false, true, false),
+        "Preview only. Run kache init --no-shell to apply."
+    );
+    assert_eq!(preview_end(false, true, false, false), "Nothing to change.");
+}
+
+#[test]
+fn init_steps_follow_the_plans() {
+    assert_eq!(edit_action(false, false), "keep");
+    assert_eq!(edit_action(true, false), "configure");
+    assert_eq!(edit_action(false, true), "configure");
+    for action in ["configure", "update"] {
+        assert!(step_changes(action), "{action}");
+    }
+    for action in [
+        "keep",
+        "unsupported",
+        "unavailable",
+        "manual",
+        "ensure_running",
+        "create",
+    ] {
+        assert!(!step_changes(action), "{action}");
+    }
+    assert_eq!(rustdoc_action(RustdocEdit::Write), Some("configure"));
+    assert_eq!(rustdoc_action(RustdocEdit::Already), Some("keep"));
+    assert_eq!(rustdoc_action(RustdocEdit::Leave), Some("keep"));
+    assert_eq!(rustdoc_action(RustdocEdit::Skip), None);
+    assert_eq!(service_action(true, true, true, true), None);
+    assert_eq!(
+        service_action(false, false, true, true),
+        Some("unavailable")
+    );
+    assert_eq!(service_action(false, true, true, true), Some("update"));
+    assert_eq!(service_action(false, true, true, false), Some("keep"));
+    assert_eq!(service_action(false, true, false, false), Some("configure"));
+}
+
+#[test]
+fn init_never_backs_up_a_file_it_created() {
+    let mut created = Vec::new();
+    let config = std::path::Path::new("/home/me/.cargo/config.toml");
+    let rc = std::path::Path::new("/home/me/.bashrc");
+    // The run creates the Cargo config, then edits it again for rustdoc.
+    assert!(backup_step(&mut created, config, false).is_none());
+    assert!(backup_step(&mut created, config, true).is_none());
+    assert!(backup_step(&mut created, config, false).is_none());
+    assert_eq!(created, [config]);
+    // An existing startup file is backed up before each edit.
+    for _ in 0..2 {
+        let step = backup_step(&mut created, rc, true).unwrap();
+        assert_eq!((step.component, step.action), ("backup", "create"));
+        assert_eq!(step.paths, [rc]);
+    }
+    assert_eq!(created, [config]);
+}
+
+#[test]
+fn init_steps_list_each_edit_with_the_backup_before_it() {
+    use std::path::PathBuf;
+    let cargo = PathBuf::from("/home/me/.cargo/config.toml");
+    let rc = PathBuf::from("/home/me/.bashrc");
+    let facts = |cargo_ready: bool, cargo_exists: bool, rc_exists: bool| SetupFacts {
+        cargo_path: cargo.clone(),
+        cargo: if cargo_ready { "keep" } else { "configure" },
+        cargo_exists,
+        shell: Some(SetupStep::new("shell", "configure", vec![rc.clone()])),
+        shell_changes: vec![(rc.clone(), rc_exists)],
+        rustdoc: Some("configure"),
+        test_runner: Some(SetupStep::new("test_runner", "configure", vec![rc.clone()])),
+        test_changes: vec![(rc.clone(), rc_exists)],
+        recovery: "keep",
+        recovery_path: PathBuf::from("/home/me/.config/kache/config.toml"),
+        service: Some("keep"),
+        service_path: Some(PathBuf::from("/svc")),
+    };
+    let summary = |steps: Vec<SetupStep>| {
+        steps
+            .into_iter()
+            .map(|step| {
+                let path = step
+                    .paths
+                    .first()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default();
+                format!("{} {} {path}", step.component, step.action)
+            })
+            .collect::<Vec<_>>()
+    };
+    // A fresh machine: init creates every file it edits, so no backups.
+    assert_eq!(
+        summary(setup_steps(&facts(false, false, false))),
+        [
+            "cargo configure /home/me/.cargo/config.toml",
+            "shell configure /home/me/.bashrc",
+            "rustdoc configure /home/me/.cargo/config.toml",
+            "test_runner configure /home/me/.bashrc",
+            "free_space_recovery keep /home/me/.config/kache/config.toml",
+            "login_service keep /svc",
+            "daemon ensure_running ",
+        ]
+    );
+    // Existing files are backed up before each edit.
+    assert_eq!(
+        summary(setup_steps(&facts(false, true, true))),
+        [
+            "cargo configure /home/me/.cargo/config.toml",
+            "backup create /home/me/.cargo/config.toml",
+            "shell configure /home/me/.bashrc",
+            "backup create /home/me/.bashrc",
+            "rustdoc configure /home/me/.cargo/config.toml",
+            "backup create /home/me/.cargo/config.toml",
+            "test_runner configure /home/me/.bashrc",
+            "backup create /home/me/.bashrc",
+            "free_space_recovery keep /home/me/.config/kache/config.toml",
+            "login_service keep /svc",
+            "daemon ensure_running ",
+        ]
+    );
+    // A configured machine keeps Cargo; nothing else is listed when skipped.
+    let kept = SetupFacts {
+        shell: None,
+        shell_changes: Vec::new(),
+        rustdoc: Some("keep"),
+        test_runner: None,
+        test_changes: Vec::new(),
+        recovery: "ask",
+        service: None,
+        ..facts(true, true, true)
+    };
+    assert_eq!(
+        summary(setup_steps(&kept)),
+        [
+            "cargo keep /home/me/.cargo/config.toml",
+            "rustdoc keep /home/me/.cargo/config.toml",
+            "free_space_recovery ask /home/me/.config/kache/config.toml",
+            "daemon ensure_running ",
+        ]
+    );
+}
+
 fn explain_event(result: events::EventResult, secs: i64, key: &str) -> events::BuildEvent {
     let mut event = events::BuildEvent::new_for_test("app", result);
     event.ts = chrono::DateTime::from_timestamp(1_760_454_000 + secs, 0).unwrap();
@@ -9787,6 +10048,184 @@ fn a_crate_without_misses_is_not_called_all_hits_unless_it_is() {
         "{lines:?}"
     );
     assert!(lines.contains(&"Recent events".to_string()), "{lines:?}");
+}
+
+#[test]
+fn a_run_reports_declined_and_failed_steps_as_not_done() {
+    use std::path::PathBuf;
+    let cargo = PathBuf::from("/home/me/.cargo/config.toml");
+    let plan = SetupFacts {
+        cargo_path: cargo.clone(),
+        cargo: "configure",
+        cargo_exists: true,
+        shell: None,
+        shell_changes: Vec::new(),
+        rustdoc: Some("configure"),
+        test_runner: None,
+        test_changes: Vec::new(),
+        recovery: "ask",
+        recovery_path: PathBuf::from("/home/me/.config/kache/config.toml"),
+        service: Some("configure"),
+        service_path: Some(PathBuf::from("/svc")),
+    };
+    let components = |facts: &SetupFacts| {
+        setup_steps(facts)
+            .into_iter()
+            .map(|step| format!("{} {}", step.component, step.action))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        components(&plan),
+        [
+            "cargo configure",
+            "backup create",
+            "rustdoc configure",
+            "backup create",
+            "free_space_recovery ask",
+            "login_service configure",
+            "daemon ensure_running",
+        ]
+    );
+    // The replacement was declined, so rustdoc found no kache wrapper, the
+    // question was answered no and the service did not install.
+    let declined = run_facts(
+        &plan,
+        RunOutcome {
+            cargo_applied: false,
+            rustdoc: None,
+            test_runner: None,
+            test_changes: Vec::new(),
+            recovery: "keep",
+            service_installed_now: false,
+        },
+    );
+    assert_eq!(
+        components(&declined),
+        [
+            "cargo skip",
+            "free_space_recovery keep",
+            "login_service failed",
+            "daemon ensure_running",
+        ]
+    );
+    let done = run_facts(
+        &plan,
+        RunOutcome {
+            cargo_applied: true,
+            rustdoc: Some("configure"),
+            test_runner: None,
+            test_changes: Vec::new(),
+            recovery: "configure",
+            service_installed_now: true,
+        },
+    );
+    assert_eq!(
+        components(&done),
+        [
+            "cargo configure",
+            "backup create",
+            "rustdoc configure",
+            "backup create",
+            "free_space_recovery configure",
+            "login_service configure",
+            "daemon ensure_running",
+        ]
+    );
+    // A kept Cargo config stays kept; a failed rustdoc write lists its backup.
+    let kept = run_facts(
+        &SetupFacts {
+            cargo: "keep",
+            service: Some("keep"),
+            ..plan.clone()
+        },
+        RunOutcome {
+            cargo_applied: false,
+            rustdoc: Some("failed"),
+            test_runner: None,
+            test_changes: Vec::new(),
+            recovery: "keep",
+            service_installed_now: false,
+        },
+    );
+    assert_eq!(
+        components(&kept)[..4],
+        [
+            "cargo keep",
+            "rustdoc failed",
+            "backup create",
+            "free_space_recovery keep"
+        ]
+    );
+    assert_eq!(components(&kept)[4], "login_service keep");
+}
+
+#[test]
+fn recovery_steps_say_when_init_asks() {
+    assert_eq!(recovery_action(&RecoveryOffer::Ask(1)), "ask");
+    for offer in [
+        RecoveryOffer::Nothing,
+        RecoveryOffer::FromEnv(true),
+        RecoveryOffer::Explain(1),
+    ] {
+        assert_eq!(recovery_action(&offer), "keep", "{offer:?}");
+    }
+}
+
+#[test]
+fn only_a_preview_assumes_the_shims_and_wrapper_it_describes() {
+    assert_eq!(rustdoc_assumes(true, true, true), (true, true));
+    assert_eq!(rustdoc_assumes(true, false, true), (false, true));
+    assert_eq!(rustdoc_assumes(true, true, false), (true, false));
+    // A run looks at the disk: a declined replacement leaves no kache
+    // wrapper for build.rustdoc to follow.
+    assert_eq!(rustdoc_assumes(false, true, true), (false, false));
+}
+
+#[test]
+fn a_run_reports_the_test_runner_it_planned_after_the_shell_edits() {
+    use std::path::PathBuf;
+    let rc = PathBuf::from("/home/me/.bashrc");
+    let plan = SetupFacts {
+        cargo_path: PathBuf::from("/home/me/.cargo/config.toml"),
+        cargo: "keep",
+        cargo_exists: true,
+        shell: Some(SetupStep::new("shell", "configure", vec![rc.clone()])),
+        shell_changes: vec![(rc.clone(), true)],
+        rustdoc: None,
+        test_runner: Some(SetupStep::new("test_runner", "unsupported", Vec::new())),
+        test_changes: Vec::new(),
+        recovery: "keep",
+        recovery_path: PathBuf::from("/home/me/.config/kache/config.toml"),
+        service: None,
+        service_path: None,
+    };
+    let run = run_facts(
+        &plan,
+        RunOutcome {
+            cargo_applied: false,
+            rustdoc: None,
+            test_runner: Some(SetupStep::new("test_runner", "configure", vec![rc.clone()])),
+            test_changes: vec![(rc.clone(), true)],
+            recovery: "keep",
+            service_installed_now: false,
+        },
+    );
+    let steps: Vec<_> = setup_steps(&run)
+        .into_iter()
+        .map(|step| format!("{} {}", step.component, step.action))
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            "cargo keep",
+            "shell configure",
+            "backup create",
+            "test_runner configure",
+            "backup create",
+            "free_space_recovery keep",
+            "daemon ensure_running",
+        ]
+    );
 }
 
 #[test]

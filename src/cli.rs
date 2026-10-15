@@ -5241,7 +5241,8 @@ fn cache_preview(what: &CacheClean, entries: usize, bytes: u64) -> String {
 }
 
 /// `--yes`, or a yes at `prompt` when `terminal`. Without a terminal and
-/// without `--yes` nothing is removed.
+/// without `--yes` nothing is removed and the command fails with
+/// [`no_terminal`].
 fn confirm_removal_with(
     question: &str,
     yes: bool,
@@ -5252,10 +5253,61 @@ fn confirm_removal_with(
         return Ok(true);
     }
     if !terminal {
-        println!("{question} Pass --yes to remove without asking.");
-        return Ok(false);
+        return Err(no_terminal("nothing removed", &command_args(), true));
     }
     prompt(question)
+}
+
+/// `argv` as one line the platform's shell reads back as the same words:
+/// [`shell_line`] for a POSIX shell, double quotes for cmd and PowerShell.
+fn command_line(argv: &[String], windows: bool) -> String {
+    if !windows {
+        return shell_line(argv);
+    }
+    let plain = |word: &str| {
+        !word.is_empty()
+            && word
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_./:=@+,\\~".contains(c))
+    };
+    argv.iter()
+        .map(|word| {
+            if plain(word) {
+                word.clone()
+            } else {
+                format!("\"{}\"", word.replace('"', "\\\""))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The arguments this process was started with, after the program name.
+pub(crate) fn command_args() -> Vec<String> {
+    std::env::args().skip(1).collect()
+}
+
+/// The error a command that asks first gives when there is no terminal and
+/// no `--yes`: `outcome`, then the same command line with `--yes`, and
+/// `--dry-run` when `preview` says the command has one.
+pub(crate) fn no_terminal(outcome: &str, args: &[String], preview: bool) -> anyhow::Error {
+    retry_with_yes(outcome, "there is no terminal to ask", args, preview)
+}
+
+/// [`no_terminal`] with another reason nobody answered.
+fn retry_with_yes(outcome: &str, why: &str, args: &[String], preview: bool) -> anyhow::Error {
+    let mut argv = vec!["kache".to_string()];
+    argv.extend(args.iter().cloned());
+    argv.push("--yes".to_string());
+    let preview = if preview {
+        ", or --dry-run to preview"
+    } else {
+        ""
+    };
+    anyhow::anyhow!(
+        "{outcome}: {why}. Run `{}` to go ahead without asking{preview}.",
+        command_line(&argv, cfg!(windows))
+    )
 }
 
 /// Whether nothing is at `path` any more. A lookup that fails another way,
@@ -5469,12 +5521,8 @@ fn clean_with_terminal(
 
     // The selector needs a terminal: refuse before scanning or forgetting
     // anything.
-    if !dry_run && !yes && !json {
-        crate::machine::require_tty(
-            terminal,
-            "clean",
-            "`kache clean --dry-run` or `kache clean --json`",
-        )?;
+    if !dry_run && !yes && !json && !terminal {
+        return Err(no_terminal("nothing removed", &command_args(), true));
     }
     let (root, selection) = match &scope {
         CleanScope::Scan(dir) => {
@@ -7096,6 +7144,68 @@ fn wrapper_setting_repair(
     }
 }
 
+/// Doctor's one check of the wrapper Cargo uses, as `(pass, detail, fix)`.
+/// `repair` is [`wrapper_setting_repair`]'s answer; `cargo_config` is the
+/// file `kache init` would edit.
+fn wrapper_check(
+    setting: Option<&crate::wrapper_config::WrapperSetting>,
+    repair: Option<bool>,
+    cargo_config: &std::path::Path,
+) -> (bool, String, Option<String>) {
+    use crate::wrapper_config::{WrapperSetting, display_path};
+    match setting {
+        Some(WrapperSetting::Environment { value }) if value.contains("kache") => {
+            (true, "kache via env".into(), None)
+        }
+        Some(WrapperSetting::Environment { value }) => (
+            false,
+            if value.contains("sccache") {
+                format!("sccache ({value})")
+            } else {
+                format!("{value} (not kache)")
+            },
+            Some("export RUSTC_WRAPPER=kache, or unset it and run `kache init`".into()),
+        ),
+        Some(WrapperSetting::CargoConfig { value, path }) if value.contains("kache") => {
+            (true, format!("kache via {}", display_path(path)), None)
+        }
+        Some(WrapperSetting::CargoConfig { value, path }) => (
+            false,
+            format!("{value} in {}", display_path(path)),
+            Some(match repair {
+                Some(true) => {
+                    "run `kache doctor --fix` or `kache init` to replace it with kache".to_string()
+                }
+                Some(false) => "run `kache init` to replace it with kache".to_string(),
+                None => format!(
+                    "replace `rustc-wrapper = \"{value}\"` with `rustc-wrapper = \"kache\"` in {}",
+                    path.display()
+                ),
+            }),
+        ),
+        None => (
+            false,
+            "not set".into(),
+            Some(format!(
+                "run `kache init` to set it in {}, or export RUSTC_WRAPPER=kache",
+                display_path(cargo_config)
+            )),
+        ),
+    }
+}
+
+/// Doctor's fix when `kache` is not on PATH: add the directory of the
+/// binary that is running.
+fn binary_fix(on_path: bool, running_dir: Option<&std::path::Path>) -> Option<String> {
+    if on_path {
+        return None;
+    }
+    Some(match running_dir {
+        Some(dir) => format!("add {} to PATH", dir.display()),
+        None => "add the directory that holds kache to PATH".to_string(),
+    })
+}
+
 /// File `label` under the command that repairs it, if any.
 fn note_repair(
     label: &'static str,
@@ -7163,13 +7273,7 @@ fn doctor_config_file_check(
 /// Labels of the daemon-related checks that become informational when the
 /// daemon is optional. Kept in sync with the check constructions in
 /// [`doctor`]; module-level so the disposition logic below is unit-testable.
-const DAEMON_CHECK_LABELS: [&str; 5] = [
-    "Daemon version",
-    "Daemon service",
-    "Daemon processes",
-    "Stale locks",
-    "Service exe",
-];
+const DAEMON_CHECK_LABELS: [&str; 3] = ["Daemon version", "Daemon service", "Service exe"];
 
 /// The host config path `kache stats` names, only when the host file is
 /// actually merged in: absent, disabled or unusable files are not in effect.
@@ -7296,7 +7400,7 @@ fn doctor_install_path_check(
                 selection.reason
             );
             let fix = (!survives).then(|| {
-                "rerun kache install-shims and kache daemon install after each upgrade".to_string()
+                "rerun kache init --shims and kache daemon install after each upgrade".to_string()
             });
             (survives, detail, fix)
         }
@@ -7496,7 +7600,7 @@ fn doctor_link_layout(config: &Config, build_dir: &std::path::Path) -> Check {
     let probe = crate::link_probe::probe_link_layout(build_dir, &staging);
     Check {
         label: "Link layout", pass: probe.hardlink_supported,
-        detail: format!("{} (build: {}, staging: {})", crate::link_probe::format_probe_detail(&probe), build_dir.display(), staging.display()),
+        detail: format!("{} (build: {}, staging: {})", crate::link_probe::format_probe_detail(&probe), crate::link_probe::shown_path(build_dir), crate::link_probe::shown_path(&staging)),
         fix: (!probe.hardlink_supported).then(|| "put the cache and build tree on the SAME mount for zero-copy sharing; if this layout is intentional, expect copies (see `kache report` copy reasons)".into()),
     }
 }
@@ -7536,6 +7640,7 @@ fn doctor_section(label: &str) -> &'static str {
         || label.starts_with("Store")
         || label.starts_with("Shard")
         || label.starts_with("Link")
+        || label.starts_with("Volume")
     {
         "Storage"
     } else {
@@ -7593,18 +7698,15 @@ pub fn doctor(
     } else {
         (false, "not found".into())
     };
+    let running = std::env::current_exe().ok();
     checks.push(Check {
         label: "Binary",
         pass: bin_pass,
         detail: bin_detail,
-        fix: if bin_pass {
-            None
-        } else {
-            Some(format!(
-                "cargo install --path . or add {} to PATH",
-                cargo_home_dir().join("bin").display()
-            ))
-        },
+        fix: binary_fix(
+            bin_pass,
+            running.as_deref().and_then(std::path::Path::parent),
+        ),
     });
 
     // Checks `doctor --fix` and `kache init` repair when they fail, for the
@@ -7621,90 +7723,16 @@ pub fn doctor(
         &mut fix_repairs,
         &mut init_repairs,
     );
-    let (wrapper_pass, wrapper_detail, wrapper_fix) = match wrapper_setting {
-        Some(crate::wrapper_config::WrapperSetting::Environment { value })
-            if value.contains("kache") =>
-        {
-            (true, "kache via env".into(), None)
-        }
-        Some(crate::wrapper_config::WrapperSetting::Environment { value })
-            if value.contains("sccache") =>
-        {
-            (
-                false,
-                format!("sccache ({value})"),
-                Some("export RUSTC_WRAPPER=kache".into()),
-            )
-        }
-        Some(crate::wrapper_config::WrapperSetting::Environment { value }) => (
-            false,
-            format!("{value} (not kache)"),
-            Some("export RUSTC_WRAPPER=kache".into()),
-        ),
-        Some(crate::wrapper_config::WrapperSetting::CargoConfig { value, path })
-            if value.contains("kache") =>
-        {
-            (
-                true,
-                format!("kache via {}", crate::wrapper_config::display_path(&path)),
-                None,
-            )
-        }
-        Some(crate::wrapper_config::WrapperSetting::CargoConfig { value, path }) => (
-            false,
-            format!("{value} in {}", crate::wrapper_config::display_path(&path)),
-            Some(format!(
-                "replace `rustc-wrapper = \"{value}\"` with `rustc-wrapper = \"kache\"` in {}",
-                path.display()
-            )),
-        ),
-        None => (
-            false,
-            "not set".into(),
-            Some(format!(
-                "set `build.rustc-wrapper = \"kache\"` in {} or export RUSTC_WRAPPER=kache",
-                cargo_config_target_path().display()
-            )),
-        ),
-    };
+    let (wrapper_pass, wrapper_detail, wrapper_fix) = wrapper_check(
+        wrapper_setting.as_ref(),
+        wrapper_setting_repair(wrapper_setting.as_ref(), &cargo_home),
+        &cargo_config_target_path(),
+    );
     checks.push(Check {
         label: "RUSTC_WRAPPER",
         pass: wrapper_pass,
         detail: wrapper_detail,
         fix: wrapper_fix,
-    });
-
-    // 3. Cargo config
-    let cargo_setting = crate::wrapper_config::cargo_wrapper_setting();
-    if let Some((value, path)) = &cargo_setting {
-        note_repair(
-            "Cargo config",
-            cargo_wrapper_repair(value, path, &cargo_home),
-            &mut fix_repairs,
-            &mut init_repairs,
-        );
-    }
-    let (cargo_pass, cargo_detail, cargo_fix) = match cargo_setting {
-        Some((value, path)) if value.contains("kache") => (
-            true,
-            format!("kache in {}", crate::wrapper_config::display_path(&path)),
-            None,
-        ),
-        Some((value, path)) => (
-            false,
-            format!("{value} in {}", crate::wrapper_config::display_path(&path)),
-            Some(format!(
-                "replace `rustc-wrapper = \"{value}\"` with `rustc-wrapper = \"kache\"` in {}",
-                path.display()
-            )),
-        ),
-        None => (true, "not set".to_string(), None),
-    };
-    checks.push(Check {
-        label: "Cargo config",
-        pass: cargo_pass,
-        detail: cargo_detail,
-        fix: cargo_fix,
     });
 
     let rustdoc_setting = crate::wrapper_config::cargo_rustdoc_setting();
@@ -10065,7 +10093,7 @@ fn prompt_yes_no(question: &str, default_yes: bool, auto_yes: bool) -> Result<bo
     let stdin = std::io::stdin();
     let mut line = String::new();
     if stdin.lock().read_line(&mut line)? == 0 {
-        println!("skipped (no input; use --yes to accept defaults)");
+        println!("no answer");
         PROMPT_HAD_NO_INPUT.store(true, std::sync::atomic::Ordering::Relaxed);
         return Ok(false);
     }
@@ -10317,43 +10345,65 @@ fn back_up_cargo_config(cargo_path: &std::path::Path, existing: &str) -> Result<
     Ok(())
 }
 
+/// What `build.rustdoc` needs, read from the Cargo config now. In a
+/// preview, `shim_coming` and `wrapper_coming` stand for the shim and the
+/// `rustc-wrapper` edit this run would make first. `None` when there is no
+/// shim to point at.
+#[cfg(unix)]
+fn plan_cargo_rustdoc(
+    shim_coming: bool,
+    wrapper_coming: bool,
+) -> Option<(RustdocEdit, std::path::PathBuf)> {
+    let shim = crate::compiler::shim::default_shim_dir()?.join("rustdoc");
+    if !shim_coming && !shim.is_file() {
+        return None;
+    }
+    let shim_path = shim.to_str()?;
+    let existing = std::fs::read_to_string(cargo_config_target_path()).unwrap_or_default();
+    let parsed: Option<toml::Value> = toml::from_str(&existing).ok();
+    let build = parsed.as_ref().and_then(|value| value.get("build"));
+    let setting = |key: &str| build.and_then(|build| build.get(key))?.as_str();
+    let wrapper = if wrapper_coming {
+        Some("kache")
+    } else {
+        setting("rustc-wrapper")
+    };
+    let edit = rustdoc_edit_decision(wrapper, setting("rustdoc"), shim_path);
+    Some((edit, shim))
+}
+
 /// Point `build.rustdoc` at the rustdoc shim with a backup,
 /// like the `rustc-wrapper` edit. Only a config whose wrapper is already
-/// `kache` is edited.
+/// `kache`, or is about to be in a preview, is edited. A config in
+/// `created`, which this run made itself, gets no backup. Returns the
+/// `rustdoc` step's action: what a preview would do, or what a run did.
 #[cfg(unix)]
-fn configure_cargo_rustdoc(check: bool) -> Result<()> {
-    let Some(shim_dir) = crate::compiler::shim::default_shim_dir() else {
-        return Ok(());
+fn configure_cargo_rustdoc(
+    check: bool,
+    shim_coming: bool,
+    wrapper_coming: bool,
+    created: &mut Vec<std::path::PathBuf>,
+) -> Result<Option<&'static str>> {
+    let Some((edit, shim)) = plan_cargo_rustdoc(shim_coming, wrapper_coming) else {
+        return Ok(None);
     };
-    let shim = shim_dir.join("rustdoc");
-    if !shim.is_file() {
-        return Ok(());
-    }
-    let Some(shim_path) = shim.to_str() else {
-        return Ok(());
-    };
-    let cargo_path = cargo_config_target_path();
-    let existing = std::fs::read_to_string(&cargo_path).unwrap_or_default();
-    let parsed: Option<toml::Value> = toml::from_str(&existing).ok();
-    let wrapper = parsed
-        .as_ref()
-        .and_then(|value| value.get("build"))
-        .and_then(|build| build.get("rustc-wrapper"))
-        .and_then(toml::Value::as_str);
-    let current = parsed
-        .as_ref()
-        .and_then(|value| value.get("build"))
-        .and_then(|build| build.get("rustdoc"))
-        .and_then(toml::Value::as_str);
-    match rustdoc_edit_decision(wrapper, current, shim_path) {
+    match edit {
         RustdocEdit::Write => {}
         RustdocEdit::Leave => {
             println!("  • cargo doc: build.rustdoc is already set");
-            return Ok(());
+            return Ok(rustdoc_action(edit));
         }
-        RustdocEdit::Skip | RustdocEdit::Already => return Ok(()),
+        RustdocEdit::Skip | RustdocEdit::Already => return Ok(rustdoc_action(edit)),
     }
-    let updated = match checked_rustdoc_edit(&existing, shim_path) {
+    let cargo_path = cargo_config_target_path();
+    let existing = std::fs::read_to_string(&cargo_path).unwrap_or_default();
+    // A preview runs before the wrapper step writes `[build]`, so it can only
+    // check the edit when that step has nothing to add.
+    if check && wrapper_coming {
+        println!("    Would set build.rustdoc to {}", shim.display());
+        return Ok(rustdoc_action(edit));
+    }
+    let updated = match checked_rustdoc_edit(&existing, &shim.to_string_lossy()) {
         Ok(updated) => updated,
         Err(error) => {
             println!(
@@ -10361,27 +10411,39 @@ fn configure_cargo_rustdoc(check: bool) -> Result<()> {
                 cargo_path.display(),
                 shim.display()
             );
-            return Ok(());
+            return Ok(Some("manual"));
         }
     };
     if check {
         println!("    Would set build.rustdoc to {}", shim.display());
-        return Ok(());
+        return Ok(rustdoc_action(edit));
     }
-    back_up_cargo_config(&cargo_path, &existing)?;
+    if backup_step(created, &cargo_path, true).is_some() {
+        back_up_cargo_config(&cargo_path, &existing)?;
+    }
     if let Err(error) = std::fs::write(&cargo_path, updated) {
         println!("  • cargo doc: could not set build.rustdoc ({error})");
-        return Ok(());
+        return Ok(Some("failed"));
     }
     println!("  ✓ cargo doc: build.rustdoc set");
-    Ok(())
+    Ok(rustdoc_action(edit))
 }
 
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 struct SetupStep {
     component: &'static str,
     action: &'static str,
     paths: Vec<std::path::PathBuf>,
+}
+
+impl SetupStep {
+    fn new(component: &'static str, action: &'static str, paths: Vec<std::path::PathBuf>) -> Self {
+        Self {
+            component,
+            action,
+            paths,
+        }
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -10395,66 +10457,190 @@ struct SetupResult {
     daemon_running: Option<bool>,
 }
 
-fn setup_steps(
-    cargo_path: &std::path::Path,
-    cargo_ready: bool,
-    no_shell: bool,
-    no_service: bool,
-) -> Result<Vec<SetupStep>> {
-    let mut steps = vec![SetupStep {
-        component: "cargo",
-        action: if cargo_ready { "keep" } else { "configure" },
-        paths: vec![cargo_path.to_owned()],
-    }];
-    #[cfg(unix)]
-    if !no_shell {
-        if let Some((_, paths)) = shell_startup_files()? {
-            steps.push(SetupStep {
-                component: "shell",
-                action: "configure",
-                paths,
-            });
-        } else {
-            steps.push(SetupStep {
-                component: "shell",
-                action: "unsupported",
-                paths: Vec::new(),
-            });
+/// What `kache init` found before it changes anything, or what a run did,
+/// for [`setup_steps`].
+#[derive(Clone)]
+struct SetupFacts {
+    cargo_path: std::path::PathBuf,
+    /// `keep`, `configure`, or `skip` when the replacement was declined.
+    cargo: &'static str,
+    cargo_exists: bool,
+    /// The `shell` step, and the startup files it changes with whether each
+    /// exists now.
+    shell: Option<SetupStep>,
+    shell_changes: Vec<(std::path::PathBuf, bool)>,
+    /// The `rustdoc` step's action.
+    rustdoc: Option<&'static str>,
+    test_runner: Option<SetupStep>,
+    test_changes: Vec<(std::path::PathBuf, bool)>,
+    /// The `free_space_recovery` step's action.
+    recovery: &'static str,
+    recovery_path: std::path::PathBuf,
+    /// The `login_service` step's action; `None` with `--no-service`.
+    service: Option<&'static str>,
+    service_path: Option<std::path::PathBuf>,
+}
+
+/// The JSON `steps` of `kache init`, in the order init takes them, each
+/// edit of an existing file after its backup step. Pure.
+fn setup_steps(facts: &SetupFacts) -> Vec<SetupStep> {
+    let facts = facts.clone();
+    let mut created = Vec::new();
+    let mut steps = vec![SetupStep::new(
+        "cargo",
+        facts.cargo,
+        vec![facts.cargo_path.clone()],
+    )];
+    if step_changes(facts.cargo) {
+        steps.extend(backup_step(
+            &mut created,
+            &facts.cargo_path,
+            facts.cargo_exists,
+        ));
+    }
+    steps.extend(facts.shell);
+    for (path, exists) in &facts.shell_changes {
+        steps.extend(backup_step(&mut created, path, *exists));
+    }
+    if let Some(action) = facts.rustdoc {
+        steps.push(SetupStep::new(
+            "rustdoc",
+            action,
+            vec![facts.cargo_path.clone()],
+        ));
+        // A failed write still made its backup first.
+        if step_changes(action) || action == "failed" {
+            steps.extend(backup_step(&mut created, &facts.cargo_path, true));
         }
     }
-    #[cfg(not(unix))]
-    let _ = no_shell;
-    if !no_service {
-        steps.push(SetupStep {
-            component: "login_service",
-            action: if crate::service::login_service_available() {
-                "configure"
-            } else {
-                "unavailable"
-            },
-            paths: crate::service::service_file_path().into_iter().collect(),
-        });
+    steps.extend(facts.test_runner);
+    for (path, exists) in &facts.test_changes {
+        steps.extend(backup_step(&mut created, path, *exists));
     }
-    steps.push(SetupStep {
-        component: "daemon",
-        action: "ensure_running",
-        paths: Vec::new(),
-    });
-    Ok(steps)
+    steps.push(SetupStep::new(
+        "free_space_recovery",
+        facts.recovery,
+        vec![facts.recovery_path],
+    ));
+    if let Some(action) = facts.service {
+        steps.push(SetupStep::new(
+            "login_service",
+            action,
+            facts.service_path.into_iter().collect(),
+        ));
+    }
+    steps.push(SetupStep::new("daemon", "ensure_running", Vec::new()));
+    steps
+}
+
+/// What the `build.rustdoc` planner may take as done, as (shims, wrapper):
+/// a preview has made neither the shims nor the `rustc-wrapper` edit it
+/// describes, so it stands in for them; a run reads what is on disk, which
+/// leaves out a declined wrapper replacement. Pure.
+#[cfg(any(test, unix))]
+fn rustdoc_assumes(check: bool, installs_shims: bool, wrapper_coming: bool) -> (bool, bool) {
+    (check && installs_shims, check && wrapper_coming)
+}
+
+/// What a run did, against the plan it started from.
+struct RunOutcome {
+    /// Whether the Cargo edit was made; false when it was declined.
+    cargo_applied: bool,
+    rustdoc: Option<&'static str>,
+    /// The test-runner step as planned after the compiler setup, which may
+    /// have written the same startup files.
+    test_runner: Option<SetupStep>,
+    test_changes: Vec<(std::path::PathBuf, bool)>,
+    recovery: &'static str,
+    /// Whether the login service was installed or updated now.
+    service_installed_now: bool,
+}
+
+/// [`SetupFacts`] for what a run did: a declined or failed step is not
+/// reported as done. Pure.
+fn run_facts(plan: &SetupFacts, outcome: RunOutcome) -> SetupFacts {
+    let cargo = match plan.cargo {
+        "configure" if !outcome.cargo_applied => "skip",
+        planned => planned,
+    };
+    let service = match plan.service {
+        Some("configure" | "update") if !outcome.service_installed_now => Some("failed"),
+        planned => planned,
+    };
+    SetupFacts {
+        cargo,
+        rustdoc: outcome.rustdoc,
+        test_runner: outcome.test_runner,
+        test_changes: outcome.test_changes,
+        recovery: outcome.recovery,
+        service,
+        ..plan.clone()
+    }
+}
+
+/// Whether a step with this action changes files or services.
+fn step_changes(action: &str) -> bool {
+    matches!(action, "configure" | "update")
+}
+
+/// `configure` when an edit would change a file or `extra_change` is set,
+/// such as missing shims; else `keep`.
+#[cfg(any(test, unix))]
+fn edit_action(changes_a_file: bool, extra_change: bool) -> &'static str {
+    if extra_change || changes_a_file {
+        "configure"
+    } else {
+        "keep"
+    }
+}
+
+/// `kache init` with the flags that change what it sets up, for the line
+/// that ends a preview.
+fn init_command(no_service: bool, no_shell: bool, yes: bool) -> String {
+    let mut argv = vec!["kache", "init"];
+    for (set, flag) in [
+        (no_service, "--no-service"),
+        (no_shell, "--no-shell"),
+        (yes, "--yes"),
+    ] {
+        if set {
+            argv.push(flag);
+        }
+    }
+    argv.join(" ")
+}
+
+/// What the login-service step does: `None` with `--no-service`.
+fn service_action(
+    no_service: bool,
+    available: bool,
+    installed: bool,
+    runs_another_binary: bool,
+) -> Option<&'static str> {
+    if no_service {
+        None
+    } else if !available {
+        Some("unavailable")
+    } else if runs_another_binary {
+        Some("update")
+    } else if installed {
+        Some("keep")
+    } else {
+        Some("configure")
+    }
 }
 
 /// `init`'s offer to let free-space recovery remove idle target directories
 /// too, not only cache entries. It concerns the user's own config file (see
 /// [`crate::config::user_config_path`]): the one a login daemon reads. The
 /// decision is [`recovery_offer`] and the write [`save_target_recovery`];
-/// this only reads the process's environment and stdin, and prints.
-fn offer_target_recovery(yes: bool, check: bool) -> Result<()> {
-    let path = crate::config::user_config_path();
-    let existing = read_config_text(&path)?;
-    let env = |name: &str| std::env::var(name).ok();
-    let settings = RecoverySettings::of(&existing, &env, crate::policy::running_in_ci_with(env));
-    let unattended = yes || check || !std::io::stdin().is_terminal();
-    match recovery_offer(&settings, unattended) {
+/// this only reads the process's environment and stdin, and prints. A
+/// preview says it would ask instead of asking. Returns the
+/// `free_space_recovery` step's action.
+fn offer_target_recovery(yes: bool, check: bool) -> Result<&'static str> {
+    let (offer, path, existing) = target_recovery_offer(yes)?;
+    let mut action = recovery_action(&offer);
+    match offer {
         RecoveryOffer::Nothing => {}
         RecoveryOffer::FromEnv(on) => println!(
             "  • Free-space recovery: KACHE_AUTO_RECOVER_TARGETS {} idle targets",
@@ -10464,7 +10650,12 @@ fn offer_target_recovery(yes: bool, check: bool) -> Result<()> {
             "  • Free-space recovery: cache entries below {} free; `auto_recover_targets = true` adds idle targets",
             term::bytes(floor)
         ),
+        RecoveryOffer::Ask(floor) if check => println!(
+            "  → Free-space recovery: would ask whether targets no build used for a day go too below {} free",
+            term::bytes(floor)
+        ),
         RecoveryOffer::Ask(floor) => {
+            action = "keep";
             let question = format!(
                 "Below {} free, also remove target directories no build used for a day?",
                 term::bytes(floor)
@@ -10472,6 +10663,7 @@ fn offer_target_recovery(yes: bool, check: bool) -> Result<()> {
             if !prompt_yes_no(&question, false, false)? {
                 println!("  • Free-space recovery: cache entries only");
             } else if save_target_recovery(&path, &existing)? {
+                action = "configure";
                 println!(
                     "  ✓ Free-space recovery: cache entries and idle targets ({})",
                     term::home_path(&path)
@@ -10484,7 +10676,27 @@ fn offer_target_recovery(yes: bool, check: bool) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(action)
+}
+
+/// The `free_space_recovery` step for an offer: `ask` when init asks.
+fn recovery_action(offer: &RecoveryOffer) -> &'static str {
+    match offer {
+        RecoveryOffer::Ask(_) => "ask",
+        _ => "keep",
+    }
+}
+
+/// [`recovery_offer`] for this process, with the user config file it is
+/// about and that file's text. `--check` does not count as unattended: a
+/// preview reports the question an interactive run would ask.
+fn target_recovery_offer(yes: bool) -> Result<(RecoveryOffer, std::path::PathBuf, String)> {
+    let path = crate::config::user_config_path();
+    let existing = read_config_text(&path)?;
+    let env = |name: &str| std::env::var(name).ok();
+    let settings = RecoverySettings::of(&existing, &env, crate::policy::running_in_ci_with(env));
+    let unattended = yes || !std::io::stdin().is_terminal();
+    Ok((recovery_offer(&settings, unattended), path, existing))
 }
 
 /// What `init` does about target recovery.
@@ -10500,8 +10712,8 @@ enum RecoveryOffer {
     Ask(u64),
 }
 
-/// The offer for `settings`; `unattended` when `--yes`, `--check` or a
-/// script runs `init`, which keep the default rather than turn it on.
+/// The offer for `settings`; `unattended` when `--yes` or a script runs
+/// `init`, which keep the default rather than turn it on.
 fn recovery_offer(settings: &RecoverySettings, unattended: bool) -> RecoveryOffer {
     if let Some(on) = settings.targets_from_env {
         return RecoveryOffer::FromEnv(on);
@@ -10630,9 +10842,6 @@ fn enable_target_recovery(text: &str) -> Option<String> {
 
 pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<()> {
     println!("{}\n", term::heading("kache · setup"));
-    if check {
-        println!("  Preview only. No files or services will change.\n");
-    }
 
     let cargo_path = cargo_config_target_path();
     let plan = plan_cargo_wrapper_edit(&cargo_path)?;
@@ -10643,61 +10852,145 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
     };
     let env_missing = crate::cargo_env::missing_assignments_from_path(&cargo_path)?;
     let mut cargo_ready = plan == CargoWrapperPlan::AlreadySet && env_missing.is_empty();
-    let steps = setup_steps(&cargo_path, cargo_ready, no_shell, no_service)?;
-    let mut plan_rows = vec![
-        (
-            "Cargo",
-            "caching".into(),
-            "Rust and native dependencies".into(),
+    let wrapper_coming = plan != CargoWrapperPlan::AlreadySet;
+
+    // Plan every step before asking, so the plan, the preview and the JSON
+    // steps all describe what this run does.
+    let existing_paths = |paths: Vec<std::path::PathBuf>| {
+        paths
+            .into_iter()
+            .map(|path| {
+                let exists = path.exists();
+                (path, exists)
+            })
+            .collect::<Vec<_>>()
+    };
+    #[cfg(unix)]
+    let compiler = plan_compiler_setup(no_shell)?;
+    #[cfg(unix)]
+    let tests = plan_test_runner(no_shell)?;
+    #[cfg(unix)]
+    let shell_facts = (
+        compiler.step(),
+        existing_paths(compiler.changed_paths()),
+        (!no_shell)
+            .then(|| plan_cargo_rustdoc(compiler.installs_shims(), wrapper_coming))
+            .flatten()
+            .and_then(|(edit, _)| rustdoc_action(edit)),
+        tests.step(),
+        existing_paths(tests.changed_paths()),
+    );
+    #[cfg(not(unix))]
+    let shell_facts = {
+        let _ = (no_shell, wrapper_coming, existing_paths);
+        (None, Vec::new(), None, None, Vec::new())
+    };
+    let (shell, shell_changes, rustdoc, test_runner, test_changes) = shell_facts;
+    let (recovery, recovery_path, _) = target_recovery_offer(yes)?;
+    // Asking runs the service manager, which --no-service must not touch.
+    let service_available = !no_service && crate::service::login_service_available();
+    let service_path = crate::service::service_file_path();
+    let service_installed = service_path.as_ref().is_some_and(|p| p.exists());
+    let service_problem = service_path
+        .as_deref()
+        .filter(|p| p.exists())
+        .and_then(crate::service::service_exe_problem);
+    let plan_facts = SetupFacts {
+        cargo: if cargo_ready { "keep" } else { "configure" },
+        cargo_exists: cargo_path.exists(),
+        cargo_path: cargo_path.clone(),
+        shell,
+        shell_changes,
+        rustdoc,
+        test_runner,
+        test_changes,
+        recovery: recovery_action(&recovery),
+        recovery_path,
+        service: service_action(
+            no_service,
+            service_available,
+            service_installed,
+            service_problem.is_some(),
         ),
-        ("Config", term::home_path(&cargo_path), String::new()),
-    ];
-    if !no_shell && cfg!(unix) {
-        plan_rows.push((
-            "Shell",
-            "new terminals".into(),
-            "C/C++ caching, Cargo target protection and test pacing".into(),
-        ));
-        plan_rows.push((
-            "Docs",
-            "caching".into(),
-            "cargo doc when build.rustdoc is unset".into(),
-        ));
-        for step in steps.iter().filter(|step| step.component == "shell") {
-            for path in &step.paths {
-                plan_rows.push(("Shell file", term::home_path(path), String::new()));
+        service_path: service_path.clone(),
+    };
+    let steps = setup_steps(&plan_facts);
+    #[cfg(unix)]
+    let (shell_supported, shell_activation, test_activation) = (
+        compiler.supported(),
+        compiler.activation_required(),
+        tests.activation_required(),
+    );
+    #[cfg(not(unix))]
+    let (shell_supported, shell_activation, test_activation) = (false, false, false);
+    let changes = steps.iter().any(|step| step_changes(step.action));
+
+    if !check {
+        let mut plan_rows = vec![
+            (
+                "Cargo",
+                "caching".into(),
+                "Rust and native dependencies".into(),
+            ),
+            ("Config", term::home_path(&cargo_path), String::new()),
+        ];
+        if !no_shell && shell_supported {
+            plan_rows.push((
+                "Shell",
+                "new terminals".into(),
+                "C/C++ caching, Cargo target protection and test pacing".into(),
+            ));
+            plan_rows.push((
+                "Docs",
+                "caching".into(),
+                "cargo doc when build.rustdoc is unset".into(),
+            ));
+            for step in steps.iter().filter(|step| step.component == "shell") {
+                for path in &step.paths {
+                    plan_rows.push(("Shell file", term::home_path(path), String::new()));
+                }
             }
         }
-    }
-    if !no_service {
-        plan_rows.push((
-            "Service",
-            "login".into(),
-            "start kache at login when a login service is available".into(),
-        ));
-    }
-    plan_rows.push((
-        "Daemon",
-        "background".into(),
-        "start or restart the cache if needed".into(),
-    ));
-    for line in term::named_sections(&[("Setup plan", plan_rows)]) {
-        println!("{line}");
-    }
-    println!();
-    if !check && !prompt_yes_no("Apply this setup?", true, yes)? {
-        if PROMPT_HAD_NO_INPUT.load(std::sync::atomic::Ordering::Relaxed) {
-            anyhow::bail!(
-                "init changed nothing because stdin had no answers; rerun with --yes to accept the defaults"
-            );
+        if !no_service {
+            plan_rows.push((
+                "Service",
+                "login".into(),
+                "start kache at login when a login service is available".into(),
+            ));
         }
-        println!("  Setup cancelled. No changes made.");
-        return Ok(());
+        plan_rows.push((
+            "Daemon",
+            "background".into(),
+            "start or restart the cache if needed".into(),
+        ));
+        for line in term::named_sections(&[("Setup plan", plan_rows)]) {
+            println!("{line}");
+        }
+        println!();
+        if !prompt_yes_no("Apply this setup?", true, yes)? {
+            if PROMPT_HAD_NO_INPUT.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(retry_with_yes(
+                    "init changed nothing",
+                    "stdin had no answers",
+                    &command_args(),
+                    true,
+                ));
+            }
+            println!("  Setup cancelled. No changes made.");
+            return Ok(());
+        }
     }
     println!(
         "{}",
-        term::heading(if check { "Proposed changes" } else { "Setup" })
+        term::heading(if check && changes {
+            "Proposed changes"
+        } else {
+            "Setup"
+        })
     );
+    // Files this run created: no backup of those.
+    let mut created = Vec::new();
+    let mut cargo_applied = false;
     if cargo_ready {
         println!("  ✓ Cargo caching: configured");
     } else {
@@ -10725,11 +11018,12 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
             if let Some(parent) = cargo_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            if cargo_path.exists() {
+            if backup_step(&mut created, &cargo_path, cargo_path.exists()).is_some() {
                 back_up_cargo_config(&cargo_path, &existing)?;
             }
             std::fs::write(&cargo_path, updated).context("save Cargo configuration")?;
             cargo_ready = true;
+            cargo_applied = true;
             println!("  ✓ Cargo caching: configured");
         } else {
             println!("  • Cargo caching: skipped");
@@ -10737,33 +11031,41 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
     }
 
     #[cfg(unix)]
-    let shell_pending = init_compiler_setup(no_shell, check)?;
-    #[cfg(unix)]
-    if !no_shell {
-        configure_cargo_rustdoc(check)?;
-    }
-    #[cfg(unix)]
-    let tests_pending = init_test_runner(no_shell, check)?;
-    #[cfg(not(unix))]
-    let (shell_pending, tests_pending) = {
-        let _ = no_shell;
-        (false, false)
+    let (shell_pending, rustdoc_done) = {
+        let (shims_coming, wrapper_coming) =
+            rustdoc_assumes(check, compiler.installs_shims(), wrapper_coming);
+        let pending = init_compiler_setup(compiler, check, &mut created)?;
+        let rustdoc = if no_shell {
+            None
+        } else {
+            configure_cargo_rustdoc(check, shims_coming, wrapper_coming, &mut created)?
+        };
+        (pending, rustdoc)
     };
+    #[cfg(unix)]
+    let (tests_pending, tests_done, tests_changes) = {
+        // The compiler setup may have just written the same startup files.
+        let tests = if check {
+            tests
+        } else {
+            plan_test_runner(no_shell)?
+        };
+        let step = tests.step();
+        let changes = existing_paths(tests.changed_paths());
+        (init_test_runner(tests, check, &mut created)?, step, changes)
+    };
+    #[cfg(not(unix))]
+    let (shell_pending, tests_pending, rustdoc_done, tests_done, tests_changes) =
+        (false, false, None, None, Vec::new());
 
-    offer_target_recovery(yes, check)?;
+    let recovery_done = offer_target_recovery(yes, check)?;
 
     // ── Step 2: daemon service ───────────────────────────────────
-    let service_path = crate::service::service_file_path();
-    let service_installed = service_path.as_ref().is_some_and(|p| p.exists());
-    let service_problem = service_path
-        .as_deref()
-        .filter(|p| p.exists())
-        .and_then(crate::service::service_exe_problem);
     let mut service_action_taken = false;
 
     if no_service {
         println!("  \x1b[33m→\x1b[0m Login service: skipped (--no-service)");
-    } else if !crate::service::login_service_available() {
+    } else if !service_available {
         // Containers and CI runners have no systemd user manager. Installing
         // the unit would fail, so start the daemon directly below (#1080).
         println!("  • Login service: unavailable (no systemd user session)");
@@ -10790,7 +11092,7 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
     // manual start if we just installed it.
     if check {
         println!("  Background cache: would check and start if needed.");
-        println!("\n  Preview only. Run `kache init` to apply.\n");
+        println!("\n  {}\n", preview_end(changes, no_service, no_shell, yes));
         if crate::machine::is_json() {
             crate::machine::emit(
                 "init",
@@ -10798,8 +11100,8 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
                     preview: true,
                     steps,
                     cargo_configured: cargo_ready,
-                    shell_activation_required: false,
-                    test_activation_required: false,
+                    shell_activation_required: shell_activation,
+                    test_activation_required: test_activation,
                     service_installed,
                     daemon_running: None,
                 },
@@ -10873,7 +11175,17 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
             "init",
             SetupResult {
                 preview: false,
-                steps,
+                steps: setup_steps(&run_facts(
+                    &plan_facts,
+                    RunOutcome {
+                        cargo_applied,
+                        rustdoc: rustdoc_done,
+                        test_runner: tests_done,
+                        test_changes: tests_changes,
+                        recovery: recovery_done,
+                        service_installed_now: service_action_taken,
+                    },
+                )),
                 cargo_configured: cargo_ready,
                 shell_activation_required: shell_pending,
                 test_activation_required: tests_pending,
@@ -10893,26 +11205,122 @@ fn login_service_configured(already_installed: bool, installed_now: bool) -> boo
     already_installed || installed_now
 }
 
+/// The line that ends `init --check`: the command that applies the preview,
+/// with the flags given, or that there is nothing to apply.
+fn preview_end(changes: bool, no_service: bool, no_shell: bool, yes: bool) -> String {
+    if changes {
+        format!(
+            "Preview only. Run {} to apply.",
+            init_command(no_service, no_shell, yes)
+        )
+    } else {
+        "Nothing to change.".to_string()
+    }
+}
+
+/// The `rustdoc` step for an edit, `None` when there is nothing to say.
+#[cfg(any(test, unix))]
+fn rustdoc_action(edit: RustdocEdit) -> Option<&'static str> {
+    match edit {
+        RustdocEdit::Write => Some("configure"),
+        RustdocEdit::Already | RustdocEdit::Leave => Some("keep"),
+        RustdocEdit::Skip => None,
+    }
+}
+
+/// The backup a run makes before it changes `path`, which `exists` before
+/// the change: none for a file in `created`, which the run made itself. A
+/// file that does not exist yet is created by the change and joins `created`.
+fn backup_step(
+    created: &mut Vec<std::path::PathBuf>,
+    path: &std::path::Path,
+    exists: bool,
+) -> Option<SetupStep> {
+    let made_here = created.iter().any(|made| made == path);
+    if !exists && !made_here {
+        created.push(path.to_owned());
+    }
+    (exists && !made_here).then(|| SetupStep::new("backup", "create", vec![path.to_owned()]))
+}
+
+/// What `kache init` plans for Cargo target protection and C/C++ caching:
+/// the compiler shims and the shell block that puts them first on PATH.
 #[cfg(unix)]
-fn init_compiler_setup(no_shell: bool, check: bool) -> Result<bool> {
+enum CompilerPlan {
+    /// `--no-shell`.
+    Skipped,
+    NoHome,
+    /// A login shell init cannot set up; the shim directory to use instead.
+    Unsupported(std::path::PathBuf),
+    /// A startup file init must not edit, and why.
+    Manual(String),
+    Ready {
+        shell: crate::init_shell::Shell,
+        shim_dir: std::path::PathBuf,
+        edits: Vec<crate::init_shell::Edit>,
+        extra: Vec<String>,
+        shims_ready: bool,
+    },
+}
+
+#[cfg(unix)]
+impl CompilerPlan {
+    /// The `shell` step; none with `--no-shell`.
+    fn step(&self) -> Option<SetupStep> {
+        let (action, paths) = match self {
+            Self::Skipped => return None,
+            Self::NoHome => ("unavailable", Vec::new()),
+            Self::Unsupported(_) => ("unsupported", Vec::new()),
+            Self::Manual(_) => ("manual", Vec::new()),
+            Self::Ready {
+                edits, shims_ready, ..
+            } => (
+                edit_action(edits.iter().any(|edit| edit.changed()), !shims_ready),
+                edits.iter().map(|edit| edit.path.clone()).collect(),
+            ),
+        };
+        Some(SetupStep::new("shell", action, paths))
+    }
+
+    /// The startup files a run changes.
+    fn changed_paths(&self) -> Vec<std::path::PathBuf> {
+        match self {
+            Self::Ready { edits, .. } => edits
+                .iter()
+                .filter(|edit| edit.changed())
+                .map(|edit| edit.path.clone())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether init knows this shell's startup files.
+    fn supported(&self) -> bool {
+        matches!(self, Self::Manual(_) | Self::Ready { .. })
+    }
+
+    /// Whether the shims exist once the plan is applied.
+    fn installs_shims(&self) -> bool {
+        matches!(self, Self::Ready { .. })
+    }
+
+    /// Whether this terminal needs replacing once the plan is applied.
+    fn activation_required(&self) -> bool {
+        self.installs_shims() && !crate::compiler::shim::live_shim_status().is_active()
+    }
+}
+
+#[cfg(unix)]
+fn plan_compiler_setup(no_shell: bool) -> Result<CompilerPlan> {
     use crate::init_shell::Edit;
     if no_shell {
-        println!("  • Cargo target protection and C/C++ caching: skipped (--no-shell)");
-        return Ok(false);
+        return Ok(CompilerPlan::Skipped);
     }
     let Some(shim_dir) = crate::compiler::shim::default_shim_dir() else {
-        println!("  • Cargo target protection and C/C++ caching: skipped (no home directory)");
-        return Ok(false);
+        return Ok(CompilerPlan::NoHome);
     };
     let Some((shell, paths)) = shell_startup_files()? else {
-        println!(
-            "  • Cargo target protection and C/C++ caching: shell not supported for automatic setup"
-        );
-        println!(
-            "    Use kache install-shims, then add {} to your shell's PATH.",
-            shim_dir.display()
-        );
-        return Ok(false);
+        return Ok(CompilerPlan::Unsupported(shim_dir));
     };
     let activation = shell.activation(&shim_dir)?;
     let edits = paths
@@ -10921,7 +11329,48 @@ fn init_compiler_setup(no_shell: bool, check: bool) -> Result<bool> {
         .collect::<Result<Vec<_>>>();
     let edits = match edits {
         Ok(edits) => edits,
-        Err(error) => {
+        Err(error) => return Ok(CompilerPlan::Manual(error.to_string())),
+    };
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let extra = crate::compiler::shim::names_on_path(&path, false);
+    let shims_ready = shim_dir_is_ready(&shim_dir, &extra);
+    Ok(CompilerPlan::Ready {
+        shell,
+        shim_dir,
+        edits,
+        extra,
+        shims_ready,
+    })
+}
+
+/// Apply `plan`, or describe it when `check`. Startup files this run
+/// creates go into `created`. True when a new terminal is needed.
+#[cfg(unix)]
+fn init_compiler_setup(
+    plan: CompilerPlan,
+    check: bool,
+    created: &mut Vec<std::path::PathBuf>,
+) -> Result<bool> {
+    let (shell, shim_dir, edits, extra, shims_ready) = match plan {
+        CompilerPlan::Skipped => {
+            println!("  • Cargo target protection and C/C++ caching: skipped (--no-shell)");
+            return Ok(false);
+        }
+        CompilerPlan::NoHome => {
+            println!("  • Cargo target protection and C/C++ caching: skipped (no home directory)");
+            return Ok(false);
+        }
+        CompilerPlan::Unsupported(shim_dir) => {
+            println!(
+                "  • Cargo target protection and C/C++ caching: shell not supported for automatic setup"
+            );
+            println!(
+                "    Use kache init --shims, then add {} to your shell's PATH.",
+                shim_dir.display()
+            );
+            return Ok(false);
+        }
+        CompilerPlan::Manual(error) => {
             println!(
                 "  • Cargo target protection and C/C++ caching: shell config needs manual attention"
             );
@@ -10929,11 +11378,15 @@ fn init_compiler_setup(no_shell: bool, check: bool) -> Result<bool> {
             println!("    No shell files were changed.");
             return Ok(false);
         }
+        CompilerPlan::Ready {
+            shell,
+            shim_dir,
+            edits,
+            extra,
+            shims_ready,
+        } => (shell, shim_dir, edits, extra, shims_ready),
     };
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let extra = crate::compiler::shim::names_on_path(&path, false);
-    let shims_ready = shim_dir_is_ready(&shim_dir, &extra);
-    let needs_edit = edits.iter().any(Edit::changed);
+    let needs_edit = edits.iter().any(|edit| edit.changed());
     if !shims_ready || needs_edit {
         println!("  Cargo target protection and C/C++ caching in new terminals");
         for edit in edits.iter().filter(|edit| edit.changed()) {
@@ -10950,18 +11403,11 @@ fn init_compiler_setup(no_shell: bool, check: bool) -> Result<bool> {
             install_shims_named_with_output(&shim_dir, false, &extra, false)?;
             anyhow::ensure!(
                 shim_dir_is_ready(&shim_dir, &extra),
-                "existing files in {} prevent compiler setup; inspect them before using kache install-shims --force",
+                "existing files in {} prevent compiler setup; inspect them before using kache init --shims --force",
                 shim_dir.display()
             );
         }
-        for edit in &edits {
-            if let Some(backup) = edit.apply()? {
-                println!(
-                    "    Backup: {}",
-                    crate::wrapper_config::display_path(&backup)
-                );
-            }
-        }
+        apply_shell_edits(&edits, created)?;
     }
     if crate::compiler::shim::live_shim_status().is_active() {
         println!("  ✓ Cargo target protection and C/C++ caching: active");
@@ -10972,6 +11418,25 @@ fn init_compiler_setup(no_shell: bool, check: bool) -> Result<bool> {
         println!("    {}", shell.command(&shim_dir)?);
         Ok(true)
     }
+}
+
+/// Write the startup file `edits` that change something, backing up each
+/// one that exists and is not in `created`; each file they create joins it.
+#[cfg(unix)]
+fn apply_shell_edits(
+    edits: &[crate::init_shell::Edit],
+    created: &mut Vec<std::path::PathBuf>,
+) -> Result<()> {
+    for edit in edits.iter().filter(|edit| edit.changed()) {
+        let back_up = backup_step(created, &edit.path, !edit.creates()).is_some();
+        if let Some(backup) = edit.apply_keeping(back_up)? {
+            println!(
+                "    Backup: {}",
+                crate::wrapper_config::display_path(&backup)
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The login shell and the startup files `kache init` edits for it. `None`
@@ -11035,43 +11500,124 @@ fn test_pacing(current: Option<&str>) -> TestPacing {
     }
 }
 
-/// Export `CARGO_TARGET_<HOST>_RUNNER="kache test-runner"` from the shell
-/// startup files, so `cargo test` in any project paces its test binaries.
-/// Cargo ranks the variable above a project's own runner; `kache
-/// test-runner` looks that runner up and still runs the binary under it.
-/// Returns true when a new terminal is needed.
+/// What `kache init` plans for test pacing: an export of
+/// `CARGO_TARGET_<HOST>_RUNNER="kache test-runner"` in the shell startup
+/// files.
 #[cfg(unix)]
-fn init_test_runner(no_shell: bool, check: bool) -> Result<bool> {
+enum TestPlan {
+    /// `--no-shell`.
+    Skipped,
+    /// rustc did not report its host target.
+    NoHost,
+    /// A login shell init cannot set up; the variable to export instead.
+    Unsupported(String),
+    /// A startup file init must not edit, and why.
+    Manual(String),
+    Ready {
+        var: String,
+        edits: Vec<crate::init_shell::Edit>,
+    },
+}
+
+#[cfg(unix)]
+impl TestPlan {
+    /// The `test_runner` step; none with `--no-shell`.
+    fn step(&self) -> Option<SetupStep> {
+        let (action, paths) = match self {
+            Self::Skipped => return None,
+            Self::NoHost => ("unavailable", Vec::new()),
+            Self::Unsupported(_) => ("unsupported", Vec::new()),
+            Self::Manual(_) => ("manual", Vec::new()),
+            Self::Ready { edits, .. } => (
+                edit_action(edits.iter().any(|edit| edit.changed()), false),
+                edits.iter().map(|edit| edit.path.clone()).collect(),
+            ),
+        };
+        Some(SetupStep::new("test_runner", action, paths))
+    }
+
+    /// The startup files a run changes.
+    fn changed_paths(&self) -> Vec<std::path::PathBuf> {
+        match self {
+            Self::Ready { edits, .. } => edits
+                .iter()
+                .filter(|edit| edit.changed())
+                .map(|edit| edit.path.clone())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether this terminal needs replacing once the plan is applied.
+    fn activation_required(&self) -> bool {
+        match self {
+            Self::Ready { var, .. } => {
+                test_pacing(std::env::var(var).ok().as_deref()) == TestPacing::Pending
+            }
+            _ => false,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn plan_test_runner(no_shell: bool) -> Result<TestPlan> {
     use crate::init_shell::{Edit, TEST_RUNNER_BLOCK};
     if no_shell {
-        println!("  • Test pacing: skipped (--no-shell)");
-        return Ok(false);
+        return Ok(TestPlan::Skipped);
     }
     let Some(host) = rustc_host() else {
-        println!("  • Test pacing: skipped (rustc did not report its host target)");
-        return Ok(false);
+        return Ok(TestPlan::NoHost);
     };
     let var = crate::test_runner::runner_var(&host);
     let Some((shell, paths)) = shell_startup_files()? else {
-        println!("  • Test pacing: shell not supported for automatic setup");
-        println!("    Export {var}=\"{TEST_RUNNER}\" from your shell's startup file.");
-        return Ok(false);
+        return Ok(TestPlan::Unsupported(var));
     };
     let export = shell.export_unless_set(&var, TEST_RUNNER)?;
     let edits = paths
         .into_iter()
         .map(|path| Edit::plan_block(path, TEST_RUNNER_BLOCK, &export))
         .collect::<Result<Vec<_>>>();
-    let edits = match edits {
-        Ok(edits) => edits,
-        Err(error) => {
+    Ok(match edits {
+        Ok(edits) => TestPlan::Ready { var, edits },
+        Err(error) => TestPlan::Manual(error.to_string()),
+    })
+}
+
+/// Export `CARGO_TARGET_<HOST>_RUNNER="kache test-runner"` from the shell
+/// startup files, so `cargo test` in any project paces its test binaries.
+/// Cargo ranks the variable above a project's own runner; `kache
+/// test-runner` looks that runner up and still runs the binary under it.
+/// Files in `created` are not backed up. Returns true when a new terminal is
+/// needed.
+#[cfg(unix)]
+fn init_test_runner(
+    plan: TestPlan,
+    check: bool,
+    created: &mut Vec<std::path::PathBuf>,
+) -> Result<bool> {
+    let (var, edits) = match plan {
+        TestPlan::Skipped => {
+            println!("  • Test pacing: skipped (--no-shell)");
+            return Ok(false);
+        }
+        TestPlan::NoHost => {
+            println!("  • Test pacing: skipped (rustc did not report its host target)");
+            return Ok(false);
+        }
+        TestPlan::Unsupported(var) => {
+            println!("  • Test pacing: shell not supported for automatic setup");
+            println!("    Export {var}=\"{TEST_RUNNER}\" from your shell's startup file.");
+            return Ok(false);
+        }
+        TestPlan::Manual(error) => {
             println!("  • Test pacing: shell config needs manual attention");
             println!("    {error}");
             println!("    Test pacing changed no shell files.");
             return Ok(false);
         }
+        TestPlan::Ready { var, edits } => (var, edits),
     };
-    if edits.iter().any(Edit::changed) {
+    if edits.iter().any(|edit| edit.changed()) {
         println!("  Test pacing: cargo test waits for the CPU slots builds use");
         for edit in edits.iter().filter(|edit| edit.changed()) {
             println!(
@@ -11083,14 +11629,7 @@ fn init_test_runner(no_shell: bool, check: bool) -> Result<bool> {
             println!("    Would set {var} in new terminals.");
             return Ok(false);
         }
-        for edit in &edits {
-            if let Some(backup) = edit.apply()? {
-                println!(
-                    "    Backup: {}",
-                    crate::wrapper_config::display_path(&backup)
-                );
-            }
-        }
+        apply_shell_edits(&edits, created)?;
     }
     match test_pacing(std::env::var(&var).ok().as_deref()) {
         TestPacing::Active => {
@@ -11136,7 +11675,7 @@ fn shim_dir_is_ready(dir: &std::path::Path, extra_names: &[String]) -> bool {
     })
 }
 
-/// Versioned shims in `dir` that a rerun of `kache install-shims` would
+/// Versioned shims in `dir` that a rerun of `kache init --shims` would
 /// remove. `None` when there are none.
 #[cfg(unix)]
 fn stale_shims_check(dir: &std::path::Path, path: &std::ffi::OsStr) -> Option<Check> {
@@ -11155,7 +11694,7 @@ fn stale_shims_check(dir: &std::path::Path, path: &std::ffi::OsStr) -> Option<Ch
             stale.join(", "),
             term::home_path(dir)
         ),
-        fix: Some("kache install-shims".into()),
+        fix: Some("kache init --shims".into()),
     })
 }
 
@@ -11217,20 +11756,52 @@ fn install_shims_named_with_output(
     report.pruned =
         kache_shims::farm::prune(dir, &target.path, &|name| keeps_shim(&names, &path, name))?;
     if verbose {
-        for line in install_report_lines(dir, &target, &report) {
+        for line in install_report_lines(dir, &target, &report, cfg!(target_os = "linux")) {
             println!("{line}");
         }
     }
     Ok(())
 }
 
-/// What `kache install-shims` prints. Pure so each outcome is testable.
+/// Whether an install left every entry as it was.
+#[cfg(unix)]
+fn install_changed_nothing(report: &kache_shims::Installed) -> bool {
+    [
+        &report.created,
+        &report.repaired,
+        &report.refreshed,
+        &report.replaced,
+        &report.pruned,
+        &report.skipped,
+    ]
+    .iter()
+    .all(|names| names.is_empty())
+}
+
+/// What `kache init --shims` prints. Pure so each outcome is testable.
+/// `linux` adds the makepkg hint.
 #[cfg(unix)]
 fn install_report_lines(
     dir: &std::path::Path,
     target: &kache_shims::Selection,
     report: &kache_shims::Installed,
+    linux: bool,
 ) -> Vec<String> {
+    let note = (!target.stability.survives_upgrade()).then(|| {
+        format!(
+            "note: {}. Rerun `kache init --shims` after upgrading kache.",
+            target.reason
+        )
+    });
+    if install_changed_nothing(report) && report.marked {
+        let mut lines = vec![format!(
+            "Shims up to date in {} -> {}",
+            dir.display(),
+            target.path.display()
+        )];
+        lines.extend(note);
+        return lines;
+    }
     let mut lines = vec![format!(
         "Created {} in {} -> {}",
         term::counted(report.created.len() as u64, "shim", "shims"),
@@ -11286,12 +11857,7 @@ fn install_report_lines(
             report.skipped.join(", ")
         ));
     }
-    if !target.stability.survives_upgrade() {
-        lines.push(format!(
-            "note: {}. Rerun `kache install-shims` after upgrading kache.",
-            target.reason
-        ));
-    }
+    lines.extend(note);
     if !report.marked {
         lines.push(format!(
             "Left {} without a {} marker: it holds files that are not kache links.",
@@ -11320,10 +11886,12 @@ fn install_report_lines(
          until the command exits. The command remains cargo build/test/run."
             .into(),
     );
-    lines.push(format!(
-        "For makepkg, put PATH=\"{}:$PATH\" in ~/.makepkg.conf.",
-        dir.display()
-    ));
+    if linux {
+        lines.push(format!(
+            "For makepkg, put PATH=\"{}:$PATH\" in ~/.makepkg.conf.",
+            dir.display()
+        ));
+    }
     lines
 }
 
@@ -11546,7 +12114,7 @@ mod shim_install_tests {
         let check = super::stale_shims_check(&shims, std::ffi::OsStr::new("")).unwrap();
         assert!(!check.pass);
         assert!(check.detail.contains("gcc-999"), "{}", check.detail);
-        assert_eq!(check.fix.as_deref(), Some("kache install-shims"));
+        assert_eq!(check.fix.as_deref(), Some("kache init --shims"));
 
         let path = path_with_real(dir.path(), "gcc-999");
         assert!(super::stale_shims_check(&shims, &path).is_none());
@@ -11578,6 +12146,7 @@ mod shim_install_tests {
             dir,
             &selection(kache_shims::Stability::InstallerManaged),
             &report,
+            true,
         );
         let expected = [
             "Created 1 shim in /home/me/shims -> /opt/homebrew/opt/kache/bin/kache",
@@ -11593,6 +12162,54 @@ mod shim_install_tests {
         ];
         assert_eq!(&lines[..expected.len()], expected);
         assert!(lines.last().unwrap().contains("~/.makepkg.conf"));
+        let elsewhere = super::install_report_lines(
+            dir,
+            &selection(kache_shims::Stability::InstallerManaged),
+            &report,
+            false,
+        );
+        assert_eq!(&elsewhere[..], &lines[..lines.len() - 1]);
+    }
+
+    #[test]
+    fn a_rerun_that_changes_nothing_says_the_shims_are_up_to_date() {
+        let dir = std::path::Path::new("/home/me/shims");
+        let current = kache_shims::Installed {
+            current: vec!["cc".into(), "c++".into()],
+            marked: true,
+            ..Default::default()
+        };
+        let stable = selection(kache_shims::Stability::InstallerManaged);
+        assert_eq!(
+            super::install_report_lines(dir, &stable, &current, true),
+            ["Shims up to date in /home/me/shims -> /opt/homebrew/opt/kache/bin/kache"]
+        );
+        let versioned = selection(kache_shims::Stability::Versioned);
+        assert_eq!(
+            super::install_report_lines(dir, &versioned, &current, true)[1],
+            "note: Homebrew's opt link does not reach this binary. Rerun `kache init --shims` after upgrading kache."
+        );
+        // Any change, or a directory left unmarked, keeps the full report.
+        let lists: [fn(&mut kache_shims::Installed) -> &mut Vec<String>; 6] = [
+            |r| &mut r.created,
+            |r| &mut r.repaired,
+            |r| &mut r.refreshed,
+            |r| &mut r.replaced,
+            |r| &mut r.pruned,
+            |r| &mut r.skipped,
+        ];
+        for list in lists {
+            let mut changed = kache_shims::Installed {
+                marked: true,
+                ..Default::default()
+            };
+            list(&mut changed).push("gcc".into());
+            let lines = super::install_report_lines(dir, &stable, &changed, true);
+            assert!(!lines[0].starts_with("Shims up to date"), "{lines:?}");
+        }
+        let unmarked = kache_shims::Installed::default();
+        let lines = super::install_report_lines(dir, &stable, &unmarked, true);
+        assert!(lines[0].starts_with("Created 0 shims"), "{lines:?}");
     }
 
     #[test]
@@ -11603,12 +12220,13 @@ mod shim_install_tests {
             dir,
             &selection(kache_shims::Stability::Versioned),
             &report,
+            true,
         );
         assert_eq!(
             &lines[..3],
             [
                 "Created 0 shims in /home/me/shims -> /opt/homebrew/opt/kache/bin/kache",
-                "note: Homebrew's opt link does not reach this binary. Rerun `kache install-shims` after upgrading kache.",
+                "note: Homebrew's opt link does not reach this binary. Rerun `kache init --shims` after upgrading kache.",
                 "Left /home/me/shims without a .kache-shims marker: it holds files that are not kache links.",
             ]
         );

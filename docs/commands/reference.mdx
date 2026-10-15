@@ -89,7 +89,7 @@ kache clean ~/src --dry-run
 
 `--dry-run` lists what the clean would remove and every target it keeps: what deleting each frees, what it holds on disk, how long since a build used it, and what the daemon's next quiet pass would do to it. It ends with the cache's size and the command that removes the selection. The freeable estimate leaves out blocks a target shares with the store or with other hardlinks, so it is what the clean gives back. `--dry-run` also lists the default targets of sibling Git worktrees, marked "found through Git", but `kache clean` skips them because Kache has not seen a build use them.
 
-Without `--dry-run` or `--yes`, a selector opens in a terminal. Without a terminal the command fails and suggests `--dry-run` or `--json`. `--json` describes the selection and removes nothing unless `--yes` is also set.
+Without `--dry-run` or `--yes`, a selector opens in a terminal. Without a terminal the command removes nothing, exits 1 and prints the same command with `--yes`. `--cache`, `--crate` and `--units` ask the same way before removing. `--json` describes the selection and removes nothing unless `--yes` is also set.
 
 Given a directory, `clean` looks under it for `target/` directories that sit next to a `Cargo.toml`, including worktrees under `.worktrees/` and `.claude/`. Other hidden directories and `node_modules` are skipped. Sizes cover every profile, custom profiles and `<triple>/<profile>` directories included. A directory selects every target under it, so it cannot be combined with `--stale` or `--orphans`.
 
@@ -154,9 +154,9 @@ kache init --no-shell
 kache init --yes
 ```
 
-`--check` reports proposed changes without writing. `--no-service` skips login-service installation. `--no-shell` leaves shell startup files alone: no shim directory on `PATH` (C/C++ compilers, `cargo` and `rustdoc`), no `build.rustdoc` edit and no test pacing. Cargo's native dependencies are still configured through `[env]`. When the service cannot be installed, such as on a Linux host without a systemd user session or a Windows account that Task Scheduler refuses, init reports why and starts the daemon directly.
+`--check` (also `--dry-run` or `-n`) lists the changes init would make, including the `build.rustdoc` edit, without writing. It ends with the `kache init` command and flags that apply them, or says there is nothing to change. With `--json`, each entry in `steps` says what init does to one component: `configure`, `update`, `keep`, or why it cannot (`unsupported`, `unavailable`, `manual`). `free_space_recovery` is `ask` when an interactive run would ask about removing idle targets. A `backup` step names each existing file init would copy before editing it. After a real run, `steps` says what was done: a declined step is `skip`, and one that did not succeed is `failed`. `--no-service` skips login-service installation. `--no-shell` leaves shell startup files alone: no shim directory on `PATH` (C/C++ compilers, `cargo` and `rustdoc`), no `build.rustdoc` edit and no test pacing. Cargo's native dependencies are still configured through `[env]`. When the service cannot be installed, such as on a Linux host without a systemd user session or a Windows account that Task Scheduler refuses, init reports why and starts the daemon directly.
 
-Init shows a setup plan and asks once before applying it. Replacing another Cargo wrapper requires a separate confirmation. `--yes` accepts both. If stdin has no answers, init exits with an error before changing files or services. Besides `rustc-wrapper`, init adds `HOST_CC` / `HOST_CXX` / `CC_KNOWN_WRAPPER_CUSTOM` under Cargo `[env]` when those keys are absent. On Windows it adds only `CC_KNOWN_WRAPPER_CUSTOM`. It never sets `CC` or `CXX`.
+Init shows a setup plan and asks once before applying it. Replacing another Cargo wrapper requires a separate confirmation. `--yes` accepts both. If stdin has no answers, init exits 1 before changing files or services and prints the same command with `--yes`. Init backs up a file before it edits it, but not a file the same run created. Besides `rustc-wrapper`, init adds `HOST_CC` / `HOST_CXX` / `CC_KNOWN_WRAPPER_CUSTOM` under Cargo `[env]` when those keys are absent. On Windows it adds only `CC_KNOWN_WRAPPER_CUSTOM`. It never sets `CC` or `CXX`.
 
 On Unix, when `build.rustc-wrapper` is `kache` and `~/.local/lib/kache/shims` holds a `rustdoc` link, init sets `build.rustdoc` to that link and backs up the Cargo config first. Cargo then runs `cargo doc` through Kache. Documentation caching requires compatible unstable Cargo flags; Rust 1.99 currently passes through. See [Rust documentation](/docs/getting-started/rustdoc) for setup and compatibility. Init does not replace a `build.rustdoc` value you already set. `--no-shell` skips this edit. Windows has no compiler shims, so `cargo doc` is not cached there.
 
@@ -194,6 +194,8 @@ kache doctor --repair
 
 `--purge-sccache` and `--repair` delete data. Check what they will remove before running them.
 
+Doctor reports issues and still exits 0; scripts read them from `kache doctor --json`. Only `--verify`, and the options that imply it, exit 1 for what they find.
+
 Doctor also reports, for information, how many misses in the latest build differ from the same crates built in another checkout ("Other checkouts"); `kache explain` says what to set. It reports where the running binary is installed ("Install path"), whether the C/C++ shims are active, broken, not first on `PATH` or not installed, and whether the login service runs a binary that no longer exists, is not executable, or is a different file from the running Kache. Run `kache daemon install` to fix the last one.
 
 With a remote configured, `kache doctor` also asks it for an object that is never written. A miss passes: the store answered and accepted the credentials. A failure names the likely cause when the store says, such as expired credentials, a secret key that does not match, a clock too far from the store's, the bucket's real region, or a bucket that does not exist. An S3 endpoint that uses plain `http://` to another machine fails its own check. For S3, a pass names where the credentials came from, and a selected AWS profile that cannot supply credentials fails the check with the profile and the cause.
@@ -216,7 +218,7 @@ Options:
 | `--manifest-path <PATH>` | Cargo manifest whose workspace members filter what is pushed and, with `--workspace`, what is pulled. Defaults to `./Cargo.toml` when it exists; without one, pushes are not filtered and `--workspace` fails |
 | `--pull` | Skip uploads |
 | `--push` | Skip downloads |
-| `--dry-run` | Plan without transfer |
+| `--dry-run`, `-n` | Plan without transfer |
 | `--all` | Ignore normal pull filtering |
 | `--workspace` | Scope pull discovery to workspace members; conflicts with `--all` |
 | `--allow-partial` | Exit successfully despite reported transfer/import failures |
