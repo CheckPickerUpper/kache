@@ -10116,7 +10116,7 @@ pub(crate) fn is_rustdoc_assignment(line: &str) -> bool {
 
 #[cfg(any(test, unix))]
 fn closes_toml_table(trimmed: &str) -> bool {
-    trimmed.starts_with('[') && trimmed.ends_with(']')
+    trimmed.starts_with('[') && toml::from_str::<toml::Table>(trimmed).is_ok()
 }
 
 #[cfg(any(test, unix))]
@@ -10158,7 +10158,7 @@ pub(crate) fn apply_rustdoc_edit(existing: &str, shim_path: &str) -> String {
     let mut in_build = false;
     for (index, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
-        if trimmed == "[build]" {
+        if trimmed.starts_with("[build]") {
             in_build = true;
             if build_header.is_none() {
                 build_header = Some(index);
@@ -10209,6 +10209,27 @@ pub(crate) fn apply_rustdoc_edit(existing: &str, shim_path: &str) -> String {
     out.push_str(&assignment);
     out.push('\n');
     out
+}
+
+/// Check that the text edit changed only the intended Cargo setting.
+#[cfg(any(test, unix))]
+fn checked_rustdoc_edit(existing: &str, shim_path: &str) -> Result<String> {
+    let updated = apply_rustdoc_edit(existing, shim_path);
+    let mut expected: toml::Value = toml::from_str(existing)?;
+    let build = expected
+        .get_mut("build")
+        .and_then(toml::Value::as_table_mut)
+        .context("Cargo config has no build table")?;
+    build.insert(
+        "rustdoc".to_string(),
+        toml::Value::String(shim_path.to_string()),
+    );
+    let actual: toml::Value = toml::from_str(&updated)?;
+    anyhow::ensure!(
+        actual == expected,
+        "could not safely set build.rustdoc; edit Cargo config manually"
+    );
+    Ok(updated)
 }
 
 /// Absolute path whose filename is `rustdoc`.
@@ -10332,12 +10353,22 @@ fn configure_cargo_rustdoc(check: bool) -> Result<()> {
         }
         RustdocEdit::Skip | RustdocEdit::Already => return Ok(()),
     }
+    let updated = match checked_rustdoc_edit(&existing, shim_path) {
+        Ok(updated) => updated,
+        Err(error) => {
+            println!(
+                "  • cargo doc: could not safely set build.rustdoc in {} ({error}); set it to {} manually",
+                cargo_path.display(),
+                shim.display()
+            );
+            return Ok(());
+        }
+    };
     if check {
         println!("    Would set build.rustdoc to {}", shim.display());
         return Ok(());
     }
     back_up_cargo_config(&cargo_path, &existing)?;
-    let updated = apply_rustdoc_edit(&existing, shim_path);
     if let Err(error) = std::fs::write(&cargo_path, updated) {
         println!("  • cargo doc: could not set build.rustdoc ({error})");
         return Ok(());
