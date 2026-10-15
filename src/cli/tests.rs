@@ -130,9 +130,10 @@ fn labels_are_key_value_pairs() {
 fn an_unstamped_log_says_the_wrapper_is_too_old() {
     let versions = std::collections::BTreeSet::from(["0.23.1".to_string()]);
     let message = nothing_to_send(12, &versions);
-    assert!(message.contains("12 compile(s)"), "{message}");
+    assert!(message.contains("12 compiles in the log"), "{message}");
     assert!(message.contains("0.23.1"), "{message}");
     assert!(message.contains("Upgrade kache"), "{message}");
+    assert!(nothing_to_send(1, &versions).starts_with("1 compile in the log"));
 
     assert_eq!(
         nothing_to_send(0, &Default::default()),
@@ -1182,7 +1183,7 @@ fn the_gc_summary_has_a_line_per_shard_it_swept() {
     assert_eq!(
         shard_store_lines(&config),
         vec![format!(
-            "Volume shard {}: {} / {} (2 entries)",
+            "Volume shard {}: {} / {} · 2 entries",
             shard_config.cache_dir.display(),
             ByteSize(shard.physical_size().unwrap()),
             ByteSize(1000),
@@ -1216,11 +1217,11 @@ fn gc_summary_compares_deduplicated_blob_bytes_with_the_limit() {
     assert_eq!(store.physical_size().unwrap(), 60);
     assert_eq!(
         gc_store_usage(&store, 90, None).unwrap(),
-        "60 B / 90 B (2 entries)"
+        "60 B / 90 B · 2 entries"
     );
     assert_eq!(
         gc_store_usage(&store, 0, None).unwrap(),
-        "60 B / 0 B (2 entries)"
+        "60 B / 0 B · 2 entries"
     );
 }
 
@@ -1869,7 +1870,7 @@ fn evicting_nothing_because_everything_is_pinned_explains_itself() {
         "must say how many were held back: {msg}"
     );
     assert!(
-        msg.contains("120s"),
+        msg.contains("within the last ~2 min"),
         "must name the grace period so the wait is bounded and knowable: {msg}"
     );
     assert!(
@@ -1888,7 +1889,7 @@ fn evicting_nothing_while_over_limit_still_explains_the_grace() {
     // needs to know the idle rule exists, or "0" reads as a broken GC.
     let msg = describe_eviction(&gc_stats(0, 0, 0), true);
     assert!(msg.contains("over its limit"), "{msg}");
-    assert!(msg.contains("120s"), "{msg}");
+    assert!(msg.contains("within the last ~2 min"), "{msg}");
 }
 
 #[test]
@@ -4113,9 +4114,283 @@ fn why_miss_diff_messages_dedupes_same_config_and_empty_other_features() {
     assert_eq!(
         messages
             .iter()
-            .filter(|m| m.contains("likely source code"))
+            .filter(|m| m.contains("likely a source"))
             .count(),
         1
+    );
+}
+
+#[test]
+fn explain_crate_last_miss_rows_name_the_key_its_config_and_what_shifts_it() {
+    use crate::events::EventResult;
+    let miss = build_event("dep", EventResult::Miss, 10, 20, 30, "abcdef0123456789");
+    let mut hit = build_event("dep", EventResult::LocalHit, 0, 1, 30, "fedcba9876543210");
+    hit.ts = miss.ts - chrono::Duration::seconds(5);
+    let meta = diff_meta("x86_64", "", &["a", "b"], &["lib"]);
+    let rows = last_miss_rows(&miss, Some(&meta), Some(&hit), Some("salt"));
+    let labels: Vec<&str> = rows.iter().map(|row| row.0).collect();
+    assert_eq!(
+        labels,
+        [
+            "Result", "Key", "Target", "Features", "Last hit", "Key salt"
+        ]
+    );
+    assert_eq!(rows[0].1, "miss");
+    assert_eq!(rows[1].1, "abcdef012345");
+    assert_eq!(rows[3].1, "a, b");
+    assert_eq!(rows[4].1, "fedcba987654");
+    assert_eq!(rows[5].1, "\"salt\"");
+
+    // A hit under the same key, or one after the miss, explains nothing.
+    let mut same = hit.clone();
+    same.cache_key = miss.cache_key.clone();
+    let mut later = hit.clone();
+    later.ts = miss.ts + chrono::Duration::seconds(5);
+    let mut simultaneous = hit.clone();
+    simultaneous.ts = miss.ts;
+    for hit in [&same, &later, &simultaneous] {
+        let rows = last_miss_rows(&miss, None, Some(hit), Some(""));
+        let labels: Vec<&str> = rows.iter().map(|row| row.0).collect();
+        assert_eq!(labels, ["Result", "Key"]);
+    }
+    let mut keyless = miss.clone();
+    keyless.cache_key.clear();
+    assert_eq!(last_miss_rows(&keyless, None, None, None)[1].1, "none");
+}
+
+#[test]
+fn explain_crate_diagnosis_lines_lead_with_the_cause() {
+    use crate::events::EventResult;
+    let miss = build_event("dep", EventResult::Miss, 10, 20, 30, "abcdef0123456789");
+    let never = MissDiagnosis::new(&miss, false, 0, false, None, false);
+    assert_eq!(
+        miss_diagnosis_lines(&miss, None, &[], &never),
+        ["  never cached: first build of this crate"]
+    );
+    assert_eq!(
+        extern_chain_lines(&never),
+        [
+            "  not analyzed: no per-dependency digests recorded",
+            "  set explain_miss = true under [cache], then rebuild",
+        ]
+    );
+    let recorded = MissDiagnosis::new(&miss, false, 0, false, None, true);
+    assert!(extern_chain_lines(&recorded).is_empty());
+
+    let now_cached = MissDiagnosis::new(&miss, false, 1, true, None, false);
+    assert_eq!(
+        miss_diagnosis_lines(&miss, None, &[], &now_cached),
+        ["  first build with these inputs: the entry is now cached"]
+    );
+    for (stored, others) in [(2, "1 other stored entry"), (3, "2 other stored entries")] {
+        let mismatch = MissDiagnosis::new(&miss, false, stored, true, None, false);
+        assert_eq!(
+            miss_diagnosis_lines(&miss, None, &[], &mismatch),
+            [format!(
+                "  key mismatch: key abcdef012345 differs from {others}"
+            )]
+        );
+    }
+
+    let mut failed = miss.clone();
+    failed.store_error = "disk full".into();
+    let not_cached = MissDiagnosis::new(&failed, false, 0, false, None, false);
+    let lines = miss_diagnosis_lines(&failed, None, &[], &not_cached);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].starts_with("  NOT CACHED: "), "{lines:?}");
+    assert!(lines[0].ends_with("reason: disk full"), "{lines:?}");
+}
+
+fn stats_entry(key: &str, profile: &str, crate_type: &str) -> crate::daemon::StatsEntry {
+    crate::daemon::StatsEntry {
+        store_dirs: vec!["/nonexistent-store".into()],
+        cache_key: key.to_string(),
+        crate_name: "dep".to_string(),
+        crate_type: crate_type.to_string(),
+        profile: profile.to_string(),
+        size: 1024,
+        hit_count: 3,
+        created_at: String::new(),
+        last_accessed: "not a date".to_string(),
+        content_hash: None,
+    }
+}
+
+#[test]
+fn explain_crate_finds_the_missed_entry_only_by_its_own_key() {
+    let other = stats_entry("other-key", "", "");
+    let keyless = stats_entry("", "", "");
+    let missed = stats_entry("missed-key", "", "");
+    let stored = [&other, &keyless, &missed];
+    assert_eq!(
+        missed_entry(&stored, "missed-key").map(|e| e.cache_key.as_str()),
+        Some("missed-key")
+    );
+    assert!(
+        missed_entry(&stored, "").is_none(),
+        "a keyless miss matches nothing"
+    );
+    assert!(missed_entry(&stored, "absent").is_none());
+}
+
+#[test]
+fn explain_crate_warns_once_per_unreadable_store() {
+    let stores = [
+        crate::store_view::StoreSummary {
+            path: "/fine".into(),
+            ..Default::default()
+        },
+        crate::store_view::StoreSummary {
+            path: "/broken".into(),
+            error: Some("index locked".into()),
+            ..Default::default()
+        },
+    ];
+    assert_eq!(
+        unavailable_store_warnings(&stores),
+        ["warning: store /broken is unavailable (index locked)"]
+    );
+}
+
+#[test]
+fn explain_crate_entry_rows_name_what_sets_each_entry_apart() {
+    let entry = stats_entry("abcdef0123456789", "debug", "lib");
+    let meta = diff_meta("x86_64", "debug", &["a", "b"], &["lib"]);
+    let row = stored_entry_row(&entry, Some(&meta), Some("abcdef0123456789"));
+    assert_eq!(
+        row,
+        [
+            "abcdef012345",
+            "not a date",
+            "1.0 KiB",
+            "3",
+            "/nonexistent-store",
+            "profile debug, type lib, target x86_64, features [a, b], the missed key, stored \
+             after the compile",
+        ]
+    );
+    let bare = stats_entry("abcdef0123456789", "", "");
+    let empty = diff_meta("", "", &[], &[]);
+    assert_eq!(stored_entry_row(&bare, Some(&empty), Some("other"))[5], "");
+    assert_eq!(stored_entry_row(&bare, None, None)[5], "");
+
+    let entries: Vec<_> = (0..11)
+        .map(|i| stats_entry(&format!("key{i:02}"), "", ""))
+        .collect();
+    let refs: Vec<_> = entries.iter().collect();
+    let ten = stored_entry_lines(None, &refs[..10]);
+    assert_eq!(ten.len(), 11, "a header and ten rows: {ten:?}");
+    let eleven = stored_entry_lines(None, &refs);
+    assert_eq!(eleven.len(), 12, "{eleven:?}");
+    assert_eq!(eleven[11], "  and 1 older entry");
+}
+
+#[test]
+fn explain_crate_differences_stop_at_five_and_count_the_rest() {
+    let miss = diff_meta("wasm32", "debug", &[], &["lib"]);
+    let others = |n: usize| -> Vec<(String, crate::store::EntryMeta)> {
+        (0..n)
+            .map(|i| {
+                (
+                    format!("k{i}"),
+                    diff_meta(&format!("t{i}"), "debug", &[], &["lib"]),
+                )
+            })
+            .collect()
+    };
+    let five = difference_lines(&miss, &others(5));
+    assert_eq!(five.len(), 5, "{five:?}");
+    assert!(
+        five[0].starts_with("    - different target vs k0"),
+        "{five:?}"
+    );
+    let seven = difference_lines(&miss, &others(7));
+    assert_eq!(seven.len(), 6, "{seven:?}");
+    assert_eq!(seven[5], "    and 2 more");
+}
+
+#[test]
+fn explain_crate_cascade_notes_uncached_compiles_and_unresolved_endpoints() {
+    use crate::events::EventResult;
+    use crate::miss_chain::{Chain, ChangedDep, PassthroughGroup, Root, RootKind};
+    let miss = build_event("app", EventResult::Miss, 10, 20, 30, "abcdef0123456789");
+    let chain = |kind: RootKind, passthroughs: Vec<PassthroughGroup>| Chain {
+        roots: vec![Root {
+            crate_name: "leaf".to_string(),
+            unit: None,
+            kind,
+            passthroughs,
+            branches: 1,
+            path: Vec::new(),
+        }],
+        direct: vec![ChangedDep {
+            name: "leaf".to_string(),
+            from: Some("a".to_string()),
+            to: Some("b".to_string()),
+            unit: None,
+        }],
+        truncated: None,
+        baseline_root: None,
+    };
+    let resolved = MissDiagnosis::new(
+        &miss,
+        false,
+        0,
+        false,
+        Some(chain(
+            RootKind::Groups(vec!["sources".to_string()]),
+            vec![PassthroughGroup {
+                reason: "unsupported flag".to_string(),
+                count: 2,
+            }],
+        )),
+        true,
+    );
+    assert_eq!(
+        extern_chain_lines(&resolved),
+        [
+            "  this miss is downstream of a dependency that changed (leaf)",
+            "  root: leaf, its own inputs changed: sources",
+            "    2x uncached compile in leaf: unsupported flag",
+            "    (uncached compiles make the artifact vary per checkout; attributed by package \
+             directory)",
+        ]
+    );
+    let unresolved = MissDiagnosis::new(
+        &miss,
+        false,
+        0,
+        false,
+        Some(chain(RootKind::NoBaseline, Vec::new())),
+        true,
+    );
+    assert_eq!(
+        extern_chain_lines(&unresolved),
+        [
+            "  this miss is downstream of a dependency that changed (leaf)",
+            "  unresolved: leaf, nothing earlier to compare it against",
+            "  note: no endpoint could be resolved; the recorded history does not explain this \
+             miss",
+        ]
+    );
+}
+
+#[test]
+fn explain_crate_sections_skip_empty_bodies_and_tabulate_events() {
+    use crate::events::EventResult;
+    assert!(section("Hints", Vec::new()).is_empty());
+    assert_eq!(
+        section("Hints", vec!["  a".to_string()]),
+        ["", "Hints", "  a"]
+    );
+    assert_eq!(stored_entry_lines(None, &[]), ["  none"]);
+    let miss = build_event("dep", EventResult::Miss, 10, 20, 2048, "abcdef0123456789");
+    let lines = recent_event_lines(&[&miss]);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines[0].starts_with("  TIME"), "{lines:?}");
+    assert!(
+        lines[1].ends_with("miss     abcdef012345     20 ms   2.0 KiB"),
+        "{lines:?}"
     );
 }
 
@@ -4520,7 +4795,7 @@ fn render_stats_cache_shards_use_blob_bytes_and_label_missing_metadata() {
             (
                 "Store",
                 "2.0 KiB".into(),
-                "logical (blob size unavailable) · of 4.0 KiB · 1 entries · /cache-two".into()
+                "logical (blob size unavailable) · of 4.0 KiB · 1 entry · /cache-two".into()
             ),
         ]
     );
@@ -5221,7 +5496,10 @@ fn render_stats_offline_and_not_configured() {
 #[test]
 fn cache_limit_note_names_the_disk_share_budget() {
     const GIB: u64 = 1 << 30;
-    let share = format!(" (5% of {}, floor 5GiB, cap 100GiB)", ByteSize(200 * GIB));
+    let share = format!(
+        " (5% of {}, floor 5.0 GiB, cap 100.0 GiB)",
+        ByteSize(200 * GIB)
+    );
     // 5% of 200 GiB is 10 GiB, inside the floor and the cap.
     assert_eq!(cache_limit_note(0, 10 * GIB, Some(200 * GIB)), share);
     assert_eq!(cache_limit_note(1, 10 * GIB, Some(200 * GIB)), share);
@@ -5230,12 +5508,12 @@ fn cache_limit_note_names_the_disk_share_budget() {
     // 5% of 1 GiB rounds to 0, then the floor raises the budget to 5 GiB.
     let floor = cache_limit_note(0, 5 * GIB, Some(GIB));
     assert!(floor.contains("floor"), "{floor}");
-    assert!(floor.contains("5GiB"), "{floor}");
+    assert!(floor.contains("floor 5.0 GiB"), "{floor}");
     assert!(floor.contains(&ByteSize(GIB).to_string()), "{floor}");
     // 5% of 4000 GiB is 200 GiB, then the cap lowers the budget to 100 GiB.
     let cap = cache_limit_note(0, 100 * GIB, Some(4000 * GIB));
     assert!(cap.contains("cap"), "{cap}");
-    assert!(cap.contains("100GiB"), "{cap}");
+    assert!(cap.contains("cap 100.0 GiB"), "{cap}");
     assert_eq!(
         cache_limit_note(0, 50 * GIB, None),
         " (default; disk size unknown)"
@@ -5429,7 +5707,7 @@ fn sync_without_remote_errors() {
     let err = sync(&config, None, false, false, false, false, false, false)
         .expect_err("sync without a remote must error");
     assert!(
-        err.to_string().contains("No remote configured"),
+        err.to_string().contains("no remote configured"),
         "got: {err}"
     );
 }
@@ -5738,7 +6016,7 @@ fn save_manifest_without_remote_errors() {
     let config = save_manifest_config(dir.path().to_path_buf(), None);
     let err = save_manifest(&config, None, None).expect_err("no remote -> error");
     assert!(
-        err.to_string().contains("No remote configured"),
+        err.to_string().contains("no remote configured"),
         "got {err}"
     );
 }
@@ -5750,7 +6028,7 @@ fn automatic_manifest_save_without_remote_errors() {
     let err =
         save_manifest_auto_for_session(&config, "key", "session").expect_err("no remote -> error");
     assert!(
-        err.to_string().contains("No remote configured"),
+        err.to_string().contains("no remote configured"),
         "got {err}"
     );
 }
@@ -7498,7 +7776,7 @@ fn held_reason_names_each_command_and_how_long_it_ran() {
     };
     assert_eq!(
         held_reason(&[], 100),
-        "another Kache cleanup or a running Cargo command holds Kache's target lock"
+        "another kache cleanup or a running Cargo command holds kache's target lock"
     );
     assert_eq!(
         held_reason(&[holder(7, "cargo run", 100 - 12)], 100),
@@ -7582,15 +7860,48 @@ fn row(workspace: &str, state: TargetState, reclaimable: u64) -> TargetRow {
 #[test]
 fn json_targets_suggest_the_orphan_clean_only_when_a_worktree_is_gone() {
     let live = [row("/wt/a", TargetState::Live, 1)];
-    assert!(targets_next_actions(&live).is_empty());
+    assert!(targets_next_actions(&live, true).is_empty());
     let one = [
         row("/wt/a", TargetState::Live, 1),
         row("/wt/b", TargetState::WorktreeDeleted, 1),
     ];
-    let next = targets_next_actions(&one);
+    let next = targets_next_actions(&one, true);
     assert_eq!(next.len(), 1);
     assert_eq!(next[0].argv, ["kache", "clean", "--orphans", "--yes"]);
-    assert_eq!(next[0].why, "1 target(s) belong to deleted worktrees");
+    assert_eq!(
+        next[0].why,
+        "1 target belongs to a deleted worktree; the daemon removes it a day after its last \
+         build. This removes it now"
+    );
+    let manual = targets_next_actions(&one, false);
+    assert_eq!(
+        manual[0].why,
+        "1 target belongs to a deleted worktree; automatic removal is off"
+    );
+}
+
+#[test]
+fn the_orphan_note_agrees_with_the_count_and_the_setting() {
+    assert_eq!(
+        orphan_note(2, true),
+        "2 targets belong to deleted worktrees; the daemon removes them a day after their \
+         last build"
+    );
+    assert_eq!(
+        orphan_note(2, false),
+        "2 targets belong to deleted worktrees"
+    );
+    assert_eq!(
+        orphan_note(1, false),
+        "1 target belongs to a deleted worktree"
+    );
+    let mut found = row("/wt/b", TargetState::WorktreeDeleted, 1);
+    found.discovered = true;
+    assert_eq!(
+        recorded_orphans(&[found, row("/wt/c", TargetState::WorktreeDeleted, 1)]),
+        1,
+        "a target found through Git is not one a build recorded"
+    );
 }
 
 #[test]
@@ -7632,7 +7943,7 @@ fn a_target_says_what_the_next_pass_does_to_it() {
     assert_eq!(next_pass_note(&Plan::default()), "");
     let mut planned = row("/wt/a", TargetState::Live, 1024);
     planned.next_pass = idle;
-    let rendered = render_targets(&[planned]).join("\n");
+    let rendered = render_targets(&[planned], true).join("\n");
     assert!(
         rendered.contains("/wt/a/target  (next pass removes it: no build used it"),
         "{rendered}"
@@ -7643,11 +7954,12 @@ fn a_target_says_what_the_next_pass_does_to_it() {
 fn the_targets_table_says_nothing_about_unit_cleanup_unless_it_is_on() {
     let mut off = row("/wt/a", TargetState::Live, 1024);
     off.unit_cleanup.status = "off".into();
-    let rendered = render_targets(&[off.clone(), row("/wt/b", TargetState::Live, 1024)]).join("\n");
+    let rendered =
+        render_targets(&[off.clone(), row("/wt/b", TargetState::Live, 1024)], true).join("\n");
     assert!(!rendered.contains("unit cleanup"), "{rendered}");
 
     off.unit_cleanup.status = "unavailable: no receipt yet".into();
-    let rendered = render_targets(&[off]).join("\n");
+    let rendered = render_targets(&[off], true).join("\n");
     assert!(
         rendered.contains("(unit cleanup: unavailable: no receipt yet)"),
         "{rendered}"
@@ -7656,7 +7968,7 @@ fn the_targets_table_says_nothing_about_unit_cleanup_unless_it_is_on() {
 
 #[test]
 fn the_targets_table_totals_and_points_at_deleted_worktrees() {
-    let one = render_targets(&[row("/wt/a", TargetState::Live, 1024)]).join("\n");
+    let one = render_targets(&[row("/wt/a", TargetState::Live, 1024)], true).join("\n");
     assert!(
         one.starts_with("1 tracked target directory: 2.0 KiB on disk, 1.0 KiB freeable"),
         "{one}"
@@ -7666,7 +7978,7 @@ fn the_targets_table_totals_and_points_at_deleted_worktrees() {
     let mut beside = row("/wt/a", TargetState::Live, 1024);
     beside.path = "/wt/a/target-b".into();
     beside.discovered = true;
-    let both = render_targets(&[row("/wt/a", TargetState::Live, 1024), beside]).join("\n");
+    let both = render_targets(&[row("/wt/a", TargetState::Live, 1024), beside], true).join("\n");
     assert!(both.contains("/wt/a/target\n"), "{both}");
     assert!(
         both.contains("/wt/a/target-b  (found through Git)"),
@@ -7679,24 +7991,34 @@ fn the_targets_table_totals_and_points_at_deleted_worktrees() {
         row("/wt/a", TargetState::Live, 1024),
         row("/wt/b", TargetState::WorktreeDeleted, 2048),
     ];
-    let many = render_targets(&rows).join("\n");
+    let many = render_targets(&rows, true).join("\n");
     assert!(
         many.starts_with("2 tracked target directories: 6.0 KiB on disk, 3.0 KiB freeable"),
         "{many}"
     );
     assert_eq!(many.matches("(worktree deleted)").count(), 1, "{many}");
     assert!(
-        many.contains("Remove the 1 deleted worktree's targets: kache clean --orphans --yes"),
+        many.ends_with(
+            "\n1 target belongs to a deleted worktree; the daemon removes it a day after its \
+             last build. To remove it now: `kache clean --orphans --yes`"
+        ),
         "{many}"
     );
-    let two = render_targets(&[
+    let two = [
         row("/wt/b", TargetState::WorktreeDeleted, 1),
         row("/wt/c", TargetState::WorktreeDeleted, 1),
-    ])
-    .join("\n");
+    ];
+    let rendered = render_targets(&two, true).join("\n");
     assert!(
-        two.contains("Remove the 2 deleted worktrees' targets"),
-        "{two}"
+        rendered.contains("removes them a day after their last build. To remove them now:"),
+        "{rendered}"
+    );
+    let manual = render_targets(&two, false).join("\n");
+    assert!(
+        manual.ends_with(
+            "2 targets belong to deleted worktrees. To remove them: `kache clean --orphans --yes`"
+        ),
+        "{manual}"
     );
 }
 
@@ -8721,6 +9043,10 @@ fn a_declined_unit_clean_says_nothing_was_removed() {
             Some("Removed 3 obsolete units (2.0 KiB).")
         );
     }
+    assert_eq!(
+        unit_clean_summary(false, Some(true), 1, 1024).as_deref(),
+        Some("Removed 1 obsolete unit (1.0 KiB).")
+    );
 }
 
 #[test]
@@ -8873,7 +9199,7 @@ fn doctor_and_full_clean_report_quarantined_indexes_without_deleting_them() {
         format!(
             "2 files ({}) retained in {} after index corruption",
             ByteSize(3000),
-            config.cache_dir.display()
+            term::home_path(&config.cache_dir)
         )
     );
     assert!(check.fix.unwrap().contains("`kache clean --cache`"));
@@ -8983,6 +9309,15 @@ fn unit_cleanup_rendering_explains_missing_evidence_and_ready_counts() {
     assert!(summary.contains("2 obsolete units"));
     assert!(summary.contains("3 live and 4 unknown units kept"));
     assert!(unit_cleanup_note(&ready).contains("2 obsolete units"));
+    let one = crate::target_liveness::Plan {
+        units: 1,
+        ..ready.clone()
+    };
+    assert!(render_unit_plan("target", &one).contains("1 obsolete unit ("));
+    assert_eq!(
+        unit_cleanup_note(&one),
+        "  (1 obsolete unit: `kache clean --units --dry-run`)"
+    );
     let empty = crate::target_liveness::Plan { units: 0, ..ready };
     assert!(unit_cleanup_note(&empty).is_empty());
     let missing = crate::target_liveness::Plan {
@@ -9352,35 +9687,37 @@ fn the_newest_compile_decides_whether_a_crate_is_cached() {
     assert_eq!(latest(&[&probe]), None);
     assert_eq!(latest(&[]), None);
 
-    let lines = uncached_compile_lines("app", &seed, Some(&miss), &[&miss, &seed]).join("\n");
+    let lines = uncached_compile_lines("app", &seed, Some(&miss), &[&miss, &seed]);
+    assert_eq!(lines[0], "kache · explain · app", "{lines:?}");
+    assert_eq!(lines[2], "`app` was compiled, not cached.", "{lines:?}");
+    assert_eq!(lines[4], "Latest compile", "{lines:?}");
     assert!(
-        lines.starts_with("`app` was compiled, not cached:"),
-        "{lines}"
+        lines.contains(&format!("  When      {}", term::local_datetime(seed.ts))),
+        "{lines:?}"
     );
     assert!(
-        lines.contains(&format!(
-            "  Latest compile: {} (key: seedseedseed)",
-            term::local_datetime(seed.ts)
-        )),
-        "{lines}"
+        lines.contains(&"  Key       seedseedseed".to_string()),
+        "{lines:?}"
     );
     assert!(
         lines.contains(
-            "    why: edit rebuild: rustc rebuilt the edited crate incrementally (adaptive seed)"
+            &"  Why       edit rebuild: rustc rebuilt the edited crate incrementally (adaptive seed)"
+                .to_string()
         ),
-        "{lines}"
+        "{lines:?}"
     );
     assert!(
         lines.contains(&format!(
-            "  Earlier miss: {} (key: missmissmiss)",
+            "  Earlier   miss   {}, key missmissmiss",
             term::local_datetime(miss.ts)
         )),
-        "{lines}"
+        "{lines:?}"
     );
-    assert!(!lines.contains("now cached"), "{lines}");
+    let joined = lines.join("\n");
+    assert!(!joined.contains("now cached"), "{joined}");
     let alone = uncached_compile_lines("app", &seed, None, &[&seed]).join("\n");
     assert!(!alone.contains("Earlier"), "{alone}");
-    assert!(alone.contains("Recent events:"), "{alone}");
+    assert!(alone.contains("\nRecent events\n"), "{alone}");
 }
 
 #[test]
@@ -9392,16 +9729,24 @@ fn a_crate_without_misses_is_not_called_all_hits_unless_it_is() {
     pass.passthrough_reason = "unsupported|cc link mode".to_string();
     assert_eq!(
         no_miss_headline("app", &[&hit, &remote]),
-        "No misses or dups found for `app` -- all events are hits!"
+        "No misses for `app`: all events are hits."
     );
     assert_eq!(
         no_miss_headline("app", &[&pass, &hit]),
-        "No misses or dups found for `app`; its latest lookup hit the cache."
+        "No misses for `app`: its latest lookup hit the cache."
     );
     assert_eq!(
         no_miss_headline("app", &[&pass]),
-        "No misses, dups or hits found for `app`."
+        "No misses or hits for `app`."
     );
+    let lines = no_miss_lines("app", &[], &[&hit]);
+    assert_eq!(lines[0], "kache · explain · app");
+    assert_eq!(lines[2], "No misses for `app`: all events are hits.");
+    assert!(
+        lines.contains(&"Stored entries (0)".to_string()),
+        "{lines:?}"
+    );
+    assert!(lines.contains(&"Recent events".to_string()), "{lines:?}");
 }
 
 #[test]
@@ -9412,16 +9757,20 @@ fn recent_events_are_the_newest_five_in_local_time() {
         .collect();
     let refs: Vec<&events::BuildEvent> = events.iter().collect();
     let lines = recent_event_lines(&refs);
-    assert_eq!(lines.len(), 6, "{lines:?}");
-    assert_eq!(lines[0], "  Recent events:");
+    assert_eq!(lines.len(), 6, "a header and five events: {lines:?}");
+    assert!(lines[0].starts_with("  TIME"), "{lines:?}");
     assert!(
         lines[1].starts_with(&format!(
-            "    [{}] local_hit",
+            "  {}   local_hit",
             term::local_clock(events[2].ts)
         )),
         "{lines:?}"
     );
-    assert!(lines[1].contains("key: key2-0123456  2.0 s"), "{lines:?}");
+    assert!(lines[1].contains("key2-0123456"), "{lines:?}");
+    assert!(
+        lines[1].contains(&term::duration_ms(events[2].elapsed_ms)),
+        "{lines:?}"
+    );
     assert!(lines[5].contains("key6-0123456"), "{lines:?}");
     assert_eq!(recent_event_lines(&refs[..2]).len(), 3);
 }
@@ -9503,7 +9852,7 @@ fn a_declined_store_is_the_latest_compile_and_a_fallback_run_is_not() {
 
     let lines = uncached_compile_lines("app", &declined, Some(&miss), &[&miss, &declined]);
     assert!(
-        lines.contains(&"    why: compiled, not stored: admission-threshold".to_string()),
+        lines.contains(&"  Why       compiled, not stored: admission-threshold".to_string()),
         "{lines:?}"
     );
 }
