@@ -11087,6 +11087,97 @@ async fn test_degraded_breaker_gates_the_download_path() {
     );
 }
 
+#[tokio::test]
+async fn demand_queue_timeouts_do_not_suppress_recovery_after_permits_are_released() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = test_remote_backend();
+    let recovery = check_request(dir.path(), "queue-timeout-recovery");
+    let pack = build_entry_pack(&recovery.key, &recovery.crate_name);
+    put_test_object(
+        &backend,
+        &test_pack_object_key(&recovery.key, &recovery.crate_name),
+        &pack,
+    )
+    .await;
+    let daemon = resilience_test_daemon(dir.path(), backend);
+    let capacity = daemon.s3_semaphore.available_permits();
+    let occupied = daemon
+        .s3_semaphore
+        .acquire_many(capacity as u32)
+        .await
+        .unwrap();
+
+    for key in [
+        "queue-timeout-one",
+        "queue-timeout-two",
+        "queue-timeout-three",
+    ] {
+        let mut queued = check_request(dir.path(), key);
+        queued.deadline_ms = Some(200);
+        assert_eq!(daemon.handle_remote_check(&queued).await.found, Some(false));
+    }
+    assert!(!daemon.remote_breaker.is_degraded());
+    assert_eq!(
+        daemon
+            .transfer_counters
+            .remote_check_roundtrips
+            .load(Ordering::Relaxed),
+        0,
+        "local queue timeouts must not dispatch backend requests"
+    );
+    drop(occupied);
+    assert_eq!(daemon.s3_semaphore.available_permits(), capacity);
+
+    let response = daemon.handle_remote_check(&recovery).await;
+    assert_eq!(
+        response.found,
+        Some(true),
+        "three local queue timeouts must not suppress a valid hit after capacity returns"
+    );
+    assert!(
+        daemon
+            .config
+            .store_dir()
+            .join(&recovery.key)
+            .join("meta.json")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn demand_queue_errors_preserve_prior_remote_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = resilience_test_daemon(dir.path(), Arc::new(PanicOnGetBackend));
+    daemon
+        .remote_breaker
+        .note_failure("GET", "first backend failure");
+    daemon.s3_semaphore.close();
+
+    let req = check_request(dir.path(), "closed-demand-queue");
+    assert_eq!(daemon.handle_remote_check(&req).await.found, Some(false));
+    daemon
+        .remote_breaker
+        .note_failure("GET", "second backend failure");
+    assert!(
+        !daemon.remote_breaker.is_degraded(),
+        "local admission errors must not count as remote failures"
+    );
+    daemon
+        .remote_breaker
+        .note_failure("GET", "third backend failure");
+    assert!(
+        daemon.remote_breaker.is_degraded(),
+        "local admission errors must not erase earlier remote failures"
+    );
+    assert_eq!(
+        daemon
+            .transfer_counters
+            .remote_check_roundtrips
+            .load(Ordering::Relaxed),
+        0
+    );
+}
+
 /// #327: a restore that exceeds `remote_restore_timeout_secs` is dropped
 /// and answered as a miss within the deadline, and the timeout feeds the
 /// breaker.

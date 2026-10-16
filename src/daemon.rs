@@ -4784,9 +4784,10 @@ impl Daemon {
             .await
         {
             Ok(permit) => permit,
-            Err(error) => {
-                let class = classify_remote_error(&error);
-                breaker_permit.failure(class, &format!("{error:#}"));
+            Err(_) => {
+                // No backend request ran while waiting for local capacity.
+                // Dropping preserves earlier failures; an unused half-open
+                // probe reopens for its normal cooldown.
                 return Response::found(false);
             }
         };
