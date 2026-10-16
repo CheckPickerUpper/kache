@@ -36,8 +36,8 @@
 //! build_script_hermetic = true` (see [`crate::config::Config::build_script_hermetic`]).
 
 use super::{
-    MAX_INPUT_FILES, Prediction, Run, ZERO_AR_DATE_ENV, fold, input_state, input_state_as,
-    modified_since, package_exclusions, parse_declarations, real_command, replay, target_dir,
+    MAX_INPUT_FILES, Prediction, Run, ZERO_AR_DATE_ENV, fold, fold_dependency_inputs, input_state,
+    modified_since, package_exclusions, parse_declarations, real_command, replay, target_dir_for,
     zero_ar_date,
 };
 use crate::compiler_store::StoreHashExt as _;
@@ -227,7 +227,7 @@ pub(super) fn run(
         return Ok(None);
     }
     let cargo_out_dir = &run.environment.out_dir;
-    let Some(target) = target_dir(cargo_out_dir) else {
+    let Some(target) = target_dir_for(cargo_out_dir, run.environment.target.as_deref()) else {
         return Ok(None);
     };
     let below_target = cargo_out_dir.strip_prefix(&target)?.to_path_buf();
@@ -296,6 +296,7 @@ pub(super) fn run(
 
 fn restore(run: &Run, sandbox: &Sandbox, record: &Record, key: &str, key_ms: u64) -> Result<()> {
     let restore_start = std::time::Instant::now();
+    validate_link_paths(&run.environment, sandbox, &record.stdout)?;
     link_out_dir(&run.environment.out_dir, &sandbox.out_dir)?;
     record_referrer(sandbox, &run.environment.out_dir)?;
     replay(
@@ -314,6 +315,25 @@ fn restore(run: &Run, sandbox: &Sandbox, record: &Record, key: &str, key_ms: u64
         0,
     );
     Ok(())
+}
+
+/// The script sees the sandbox as its target directory, while dependency
+/// paths can still name the original target. Guard both before publishing a
+/// sealed run or linking one left by an earlier version.
+fn validate_link_paths(
+    environment: &super::Environment,
+    sandbox: &Sandbox,
+    stdout: &str,
+) -> Result<()> {
+    let mut seen = environment.clone();
+    seen.out_dir = sandbox.out_dir.clone();
+    seen.mappings
+        .retain(|(_, placeholder)| *placeholder != "${KACHE_OUT_DIR}");
+    seen.mappings
+        .push((sandbox.out_dir.clone(), "${KACHE_OUT_DIR}"));
+    seen.mappings
+        .push((sandbox.root.clone(), super::TARGET_DIR_PLACEHOLDER));
+    super::outside::validate_named_paths(stdout, &seen)
 }
 
 /// Folds the variables the script declared with `rerun-if-env-changed`.
@@ -343,7 +363,7 @@ fn fold_declared_env(
 /// the sandbox repeats it.
 pub(super) fn key(run: &Run, prediction: &Prediction, below_target: &Path) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
-    fold(&mut hasher, "kind", b"kache-build-script-hermetic-v1");
+    fold(&mut hasher, "kind", b"kache-build-script-hermetic-v2");
     fold(
         &mut hasher,
         "key_version",
@@ -366,15 +386,14 @@ pub(super) fn key(run: &Run, prediction: &Prediction, below_target: &Path) -> Re
             Some(value) => fold(&mut hasher, "cargo_env_value", value.as_encoded_bytes()),
             None => fold(&mut hasher, "cargo_env_absent", b""),
         }
-        if name.starts_with("DEP_")
-            && let Some(path) = value.map(PathBuf::from)
-            && path.is_absolute()
-            && path.exists()
-        {
-            let state = input_state_as(&path, &[], &file_hasher, &mut budget, 0, None)?;
-            fold(&mut hasher, "cargo_env_path_state", state.as_bytes());
-        }
     }
+    fold_dependency_inputs(
+        &mut hasher,
+        &run.environment,
+        &file_hasher,
+        &mut budget,
+        false,
+    )?;
     fold_declared_env(&mut hasher, &prediction.env, |name| std::env::var_os(name));
     for declared in &prediction.inputs {
         let path = PathBuf::from(run.environment.denormalize_str(declared));
@@ -511,7 +530,8 @@ fn attempt(
     std::fs::copy(real, &script)?;
 
     let started = std::time::SystemTime::now();
-    let target = target_dir(&run.environment.out_dir).context("no target directory")?;
+    let target = target_dir_for(&run.environment.out_dir, run.environment.target.as_deref())
+        .context("no target directory")?;
     let mut command = real_command(&script, argv);
     command
         .env("OUT_DIR", &sandbox.out_dir)
@@ -535,6 +555,10 @@ fn attempt(
         return Ok(None);
     };
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if let Err(error) = validate_link_paths(&run.environment, sandbox, &stdout) {
+        tracing::debug!("hermetic build script has an unowned link path: {error}");
+        return Ok(None);
+    }
     // The key was computed before the run, maybe before waiting for the
     // lock; an input edited meanwhile is older than `started`.
     if key(run, prediction, below_target)? != expected_key {
@@ -796,6 +820,188 @@ pub(crate) mod test_support {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hermetic_records_refuse_sibling_units_before_linking_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let out_dir = target.join("debug/build/pkg-1/out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::write(out_dir.join("untouched"), "keep").unwrap();
+        let environment = super::super::Environment {
+            out_dir: out_dir.clone(),
+            manifest_dir: directory.path().join("package"),
+            mappings: vec![
+                (out_dir.clone(), "${KACHE_OUT_DIR}"),
+                (target.clone(), super::super::TARGET_DIR_PLACEHOLDER),
+            ],
+            spellings: Vec::new(),
+            base_dirs: Vec::new(),
+            dependency_roots: Vec::new(),
+            target: None,
+            ownership_roots: Vec::new(),
+        };
+        let config = crate::test_support::test_config(directory.path().join("cache"));
+        let mut run = Run {
+            store: crate::store::Store::open(&config).unwrap(),
+            config,
+            binary_hash: "script".into(),
+            environment,
+            start: std::time::Instant::now(),
+        };
+        let key = "ab".repeat(32);
+        let sandbox = Sandbox::new(
+            &run.config.cache_dir,
+            &key,
+            Path::new("debug/build/pkg-1/out"),
+        );
+        std::fs::create_dir_all(&sandbox.out_dir).unwrap();
+        let own = format!("cargo:rustc-link-search={}\n", sandbox.out_dir.display());
+        validate_link_paths(&run.environment, &sandbox, &own).unwrap();
+        for root in [&target, &sandbox.root] {
+            let sibling = root.join("debug/build/scratch-1/out/lib");
+            let stdout = format!("cargo:rustc-link-search={}\n", sibling.display());
+            assert!(validate_link_paths(&run.environment, &sandbox, &stdout).is_err());
+            let record = Record {
+                version: RECORD_VERSION,
+                stdout: stdout.clone(),
+                stderr: String::new(),
+            };
+            assert!(restore(&run, &sandbox, &record, &key, 0).is_err());
+            assert!(std::fs::symlink_metadata(&out_dir).unwrap().is_dir());
+            assert_eq!(std::fs::read(out_dir.join("untouched")).unwrap(), b"keep");
+            run.environment.dependency_roots = super::super::outside::dependency_roots([(
+                "DEP_SCRATCH_ROOT".into(),
+                sibling.parent().unwrap().as_os_str().to_os_string(),
+            )]);
+            validate_link_paths(&run.environment, &sandbox, &stdout).unwrap();
+            run.environment.dependency_roots.clear();
+        }
+    }
+
+    #[test]
+    fn hermetic_ownership_uses_captured_one_hyphen_and_custom_targets() {
+        for target_name in ["wasm32-wasip1", "wasm32-wasip2", "wasm32v1-none", "board"] {
+            for (unit, other_unit) in [
+                ("dep-0123456789abcdef", "dep-fedcba9876543210"),
+                ("dep/0123456789abcdef", "dep/fedcba9876543210"),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let target = directory.path().join("target");
+                let below = PathBuf::from(target_name).join("debug/build/own-0123456789abcdef/out");
+                let out_dir = target.join(&below);
+                std::fs::create_dir_all(&out_dir).unwrap();
+                let sandbox =
+                    Sandbox::new(&directory.path().join("cache"), &"ab".repeat(32), &below);
+                std::fs::create_dir_all(&sandbox.out_dir).unwrap();
+                let mut environment = super::super::Environment {
+                    out_dir: out_dir.clone(),
+                    manifest_dir: directory.path().join("package"),
+                    mappings: vec![
+                        (out_dir.clone(), "${KACHE_OUT_DIR}"),
+                        (target.clone(), super::super::TARGET_DIR_PLACEHOLDER),
+                    ],
+                    spellings: Vec::new(),
+                    base_dirs: Vec::new(),
+                    dependency_roots: Vec::new(),
+                    target: Some(target_name.into()),
+                    ownership_roots: super::super::ownership_target_roots(
+                        &out_dir,
+                        Some(std::ffi::OsStr::new(target_name)),
+                    ),
+                };
+                for root in [&target, &sandbox.root] {
+                    let build = root.join(target_name).join("debug/build");
+                    let dependency = build.join(unit).join("out");
+                    std::fs::create_dir_all(dependency.join("lib")).unwrap();
+                    let stdout = format!(
+                        "cargo:rustc-link-search={}\n",
+                        dependency.join("lib").display()
+                    );
+                    assert!(
+                        validate_link_paths(&environment, &sandbox, &stdout).is_err(),
+                        "{target_name}/{unit}"
+                    );
+                    let build_stdout = format!("cargo:rustc-link-search={}\n", build.display());
+                    assert!(validate_link_paths(&environment, &sandbox, &build_stdout).is_err());
+                    if unit.contains('/') {
+                        environment.dependency_roots = super::super::outside::dependency_roots([(
+                            "DEP_CRATE_ROOT".into(),
+                            build.join("dep").into_os_string(),
+                        )]);
+                        assert!(
+                            validate_link_paths(&environment, &sandbox, &stdout).is_err(),
+                            "a whole crate directory cannot provide every hash"
+                        );
+                    }
+                    environment.dependency_roots = super::super::outside::dependency_roots([(
+                        "DEP_Z_ROOT".into(),
+                        dependency.into_os_string(),
+                    )]);
+                    validate_link_paths(&environment, &sandbox, &stdout).unwrap();
+                    let other = format!(
+                        "cargo:rustc-link-search={}\n",
+                        build.join(other_unit).join("out/lib").display()
+                    );
+                    assert!(validate_link_paths(&environment, &sandbox, &other).is_err());
+                    environment.dependency_roots.clear();
+                }
+                let own = format!("cargo:rustc-link-search={}\n", sandbox.out_dir.display());
+                validate_link_paths(&environment, &sandbox, &own).unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hermetic_guard_keeps_canonical_profile_siblings_out_of_a_sealed_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let physical = directory.path().join("physical/debug");
+        std::fs::create_dir_all(&physical).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&physical, target.join("debug")).unwrap();
+        let out_dir = target.join("debug/build/own-0123456789abcdef/out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let mut environment = super::super::Environment {
+            out_dir: out_dir.clone(),
+            manifest_dir: directory.path().join("package"),
+            mappings: vec![
+                (out_dir.clone(), "${KACHE_OUT_DIR}"),
+                (target, super::super::TARGET_DIR_PLACEHOLDER),
+            ],
+            spellings: Vec::new(),
+            base_dirs: Vec::new(),
+            dependency_roots: Vec::new(),
+            target: None,
+            ownership_roots: super::super::ownership_target_roots(&out_dir, None),
+        };
+        let sandbox = Sandbox::new(
+            &directory.path().join("cache"),
+            &"ab".repeat(32),
+            Path::new("debug/build/own-0123456789abcdef/out"),
+        );
+        std::fs::create_dir_all(&sandbox.out_dir).unwrap();
+        let dependency = physical.join("build/dep/0123456789abcdef/out");
+        std::fs::create_dir_all(dependency.join("lib")).unwrap();
+        let stdout = format!(
+            "cargo:rustc-link-search={}\n",
+            dependency.join("lib").display()
+        );
+        assert!(validate_link_paths(&environment, &sandbox, &stdout).is_err());
+        environment.dependency_roots = super::super::outside::dependency_roots([(
+            "DEP_Z_ROOT".into(),
+            dependency.into_os_string(),
+        )]);
+        validate_link_paths(&environment, &sandbox, &stdout).unwrap();
+        let other = format!(
+            "cargo:rustc-link-search={}\n",
+            physical
+                .join("build/dep/fedcba9876543210/out/lib")
+                .display()
+        );
+        assert!(validate_link_paths(&environment, &sandbox, &other).is_err());
+    }
 
     /// A declared `OUT_DIR` keys by its name, never by the per-target value
     /// Cargo set; any other declared value still keys.

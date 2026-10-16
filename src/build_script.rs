@@ -52,6 +52,9 @@ pub(crate) mod declarations;
 mod hermetic;
 pub(crate) mod inputs;
 mod outside;
+mod rooted_links;
+
+use rooted_links::RootedSymlink;
 
 use declarations::parse_declarations;
 use inputs::{TREE_MEMO_DIR, input_state, input_state_as};
@@ -81,10 +84,10 @@ const LAUNCHER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/build-script-l
 // Version 1 could omit whitespace-padded Cargo declarations.
 const PREDICTION_SCHEMA: u32 = 2;
 const PREDICTION_PREFIX: &str = "build-script:";
-/// Folded first into every action key. A v1 key also matched runs recorded
-/// before kache stored the files a script names outside `OUT_DIR`, and
-/// restoring one replayed a link search into an empty directory.
-const ACTION_KIND: &[u8] = b"kache-build-script-action-v2";
+/// A v2 key could replay a search path in a sibling Cargo build unit without
+/// restoring its library. Version 3 refuses those runs unless a dependency
+/// handed down the path and keys the dependency contents.
+const ACTION_KIND: &[u8] = b"kache-build-script-action-v3";
 /// Marks a script binary that writes into its inputs on every run.
 const UNSETTLED_PREFIX: &str = "unsettled:";
 const MANIFEST_NAME: &str = "kache-build-script.json";
@@ -331,7 +334,7 @@ pub fn run_shim() -> i32 {
             Ok(code) => Some(code),
             Err(error) => {
                 log_bypass(&error);
-                None
+                cache_bypass_exit_code(&error)
             }
         }
     } else {
@@ -478,9 +481,7 @@ fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
                     );
                     return Ok(0);
                 }
-                Err(error) => {
-                    tracing::debug!("build-script result not restored, running it: {error:#}");
-                }
+                Err(error) => continue_after_restore_failure(error)?,
             }
         }
     }
@@ -579,6 +580,40 @@ impl std::fmt::Display for InputsChanged {
 }
 
 impl std::error::Error for InputsChanged {}
+
+#[derive(Debug)]
+struct RestoreCleanupFailed;
+
+impl std::fmt::Display for RestoreCleanupFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cannot remove outputs from a rejected build-script restore")
+    }
+}
+
+impl std::error::Error for RestoreCleanupFailed {}
+
+/// Clear a rejected restore before a real script may use OUT_DIR. A successful
+/// restore needs no cleanup; a successful cleanup preserves the restore error.
+fn finish_restore<T>(restored: Result<T>, cleanup: impl FnOnce() -> Result<()>) -> Result<T> {
+    if restored.is_err() {
+        cleanup().context(RestoreCleanupFailed)?;
+    }
+    restored
+}
+
+fn continue_after_restore_failure(error: anyhow::Error) -> Result<()> {
+    if cache_bypass_exit_code(&error).is_some() {
+        return Err(error);
+    }
+    tracing::debug!("build-script result not restored, running it: {error:#}");
+    Ok(())
+}
+
+/// A rejected restore whose outputs could not be removed cannot fall back to
+/// the real script. The marker survives extra context at either caller.
+fn cache_bypass_exit_code(error: &anyhow::Error) -> Option<i32> {
+    error.is::<RestoreCleanupFailed>().then_some(1)
+}
 
 /// File systems stamp writes from a clock that advances in ticks (a jiffy on
 /// Linux, 15.6 ms by default on Windows), so a write just after `now` can
@@ -679,6 +714,11 @@ struct OutputRoots {
 struct Environment {
     out_dir: PathBuf,
     manifest_dir: PathBuf,
+    /// Cargo's target name, captured with the roots before execution.
+    target: Option<std::ffi::OsString>,
+    /// Target views derived from canonical OUT_DIR. These constrain ownership
+    /// without substituting text: symlinked profiles can change prefix shape.
+    ownership_roots: Vec<PathBuf>,
     /// Longest first, so nested roots map before their parents.
     mappings: Vec<(PathBuf, &'static str)>,
     /// Each root as Cargo spelled it, without the canonical spellings
@@ -687,6 +727,9 @@ struct Environment {
     /// `KACHE_BASE_DIR`, in both spellings when it is reached through a
     /// symlink. See [`remap_flag_base_dirs`].
     base_dirs: Vec<PathBuf>,
+    /// Absolute DEP_* paths captured before the script runs, with canonical
+    /// aliases. They are inputs, not outputs owned by this script.
+    dependency_roots: Vec<PathBuf>,
 }
 
 impl Environment {
@@ -698,12 +741,14 @@ impl Environment {
             out_dir.is_absolute() && manifest_dir.is_absolute(),
             "build-script roots must be absolute"
         );
+        let target = std::env::var_os("TARGET");
+        let ownership_roots = ownership_target_roots(&out_dir, target.as_deref());
         let mut mappings = vec![
             (out_dir.clone(), "${KACHE_OUT_DIR}"),
             (manifest_dir.clone(), "${KACHE_MANIFEST_DIR}"),
         ];
-        if let Some(target) = target_dir(&out_dir) {
-            mappings.push((target, TARGET_DIR_PLACEHOLDER));
+        if let Some(target_dir) = target_dir_for(&out_dir, target.as_deref()) {
+            mappings.push((target_dir, TARGET_DIR_PLACEHOLDER));
         }
         let cargo_home = std::env::var_os("CARGO_HOME")
             .map(PathBuf::from)
@@ -738,9 +783,12 @@ impl Environment {
         Ok(Self {
             out_dir,
             manifest_dir,
+            target,
+            ownership_roots,
             mappings,
             spellings,
             base_dirs,
+            dependency_roots: outside::dependency_roots(std::env::vars_os()),
         })
     }
 
@@ -787,6 +835,17 @@ impl Environment {
         self.mappings.iter().any(|(root, placeholder)| {
             *placeholder == TARGET_DIR_PLACEHOLDER && path.starts_with(root)
         })
+    }
+
+    /// All Cargo target views used by ownership guards. Derived canonical
+    /// views need not share the spelling layout used for text substitution.
+    fn target_roots(&self) -> impl Iterator<Item = &Path> {
+        self.mappings
+            .iter()
+            .filter_map(|(root, placeholder)| {
+                (*placeholder == TARGET_DIR_PLACEHOLDER).then_some(root.as_path())
+            })
+            .chain(self.ownership_roots.iter().map(PathBuf::as_path))
     }
 
     /// Every root with its placeholder, `KACHE_BASE_DIR` included.
@@ -957,15 +1016,34 @@ fn remap_flag_base_dirs(text: &[u8], base_dirs: &[PathBuf]) -> Vec<u8> {
 /// `<target>/[<triple>/]<profile>/build/<pkg>-<hash>/out`, or
 /// `.../build/<pkg>/<hash>/out`, back to `<target>`.
 pub(crate) fn target_dir(out_dir: &Path) -> Option<PathBuf> {
+    target_dir_for(out_dir, std::env::var_os("TARGET").as_deref())
+}
+
+/// The target root using the target name captured for this run.
+fn target_dir_for(out_dir: &Path, target_name: Option<&OsStr>) -> Option<PathBuf> {
     let profile = crate::cargo_layout::out_dir_profile(out_dir)?;
     let mut target = profile.parent()?;
-    if let Some(triple) = std::env::var_os("TARGET")
-        && target.file_name() == Some(triple.as_os_str())
+    if target_name.is_some_and(|name| target.file_name() == Some(name))
         && let Some(parent) = target.parent()
     {
         target = parent;
     }
     Some(target.to_path_buf())
+}
+
+/// A symlink below the lexical target root may move the profile or triple
+/// into another tree. Guard canonical siblings there without treating this
+/// possibly different prefix layout as a text-replacement alias.
+fn ownership_target_roots(out_dir: &Path, target_name: Option<&OsStr>) -> Vec<PathBuf> {
+    let mut roots: Vec<_> = target_dir_for(out_dir, target_name).into_iter().collect();
+    if let Ok(canonical) = out_dir.canonicalize()
+        && let Some(root) = target_dir_for(&canonical, target_name)
+    {
+        roots.push(root);
+    }
+    roots.sort();
+    roots.dedup();
+    roots
 }
 
 pub(crate) fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -1098,13 +1176,12 @@ pub(crate) fn replace_all(haystack: &[u8], needle: &[u8], replacement: &[u8]) ->
 
 /// Cargo-provided environment that shapes a run and is not otherwise keyed.
 /// `NUM_JOBS` and the jobserver variables describe the machine, not the run.
-fn cargo_environment(environment: &Environment) -> BTreeMap<String, Option<String>> {
+fn cargo_environment(environment: &Environment) -> BTreeMap<String, Option<Vec<u8>>> {
     cargo_environment_names()
         .into_iter()
         .map(|name| {
-            let value = std::env::var(&name).ok().map(|value| {
-                String::from_utf8_lossy(&environment.normalize_value(value.as_bytes())).into_owned()
-            });
+            let value = std::env::var_os(&name)
+                .map(|value| environment.normalize_value(value.as_encoded_bytes()));
             (name, value)
         })
         .collect()
@@ -1192,6 +1269,48 @@ pub(crate) fn fold(hasher: &mut blake3::Hasher, label: &str, value: &[u8]) {
     hasher.update(value);
 }
 
+/// Key the same captured dependency inputs that the ownership guard permits.
+/// Regular runs map checkout roots; hermetic runs retain the paths they read.
+fn fold_dependency_inputs(
+    hasher: &mut blake3::Hasher,
+    environment: &Environment,
+    file_hasher: &crate::cache_key::FileHasher<'_>,
+    budget: &mut usize,
+    normalize: bool,
+) -> Result<()> {
+    // The input's own symlink text is observable even when two link chains
+    // resolve to the same physical tree. Key it without walking that tree twice.
+    for path in &environment.dependency_roots {
+        if let Ok(target) = std::fs::read_link(path) {
+            for (label, value) in [
+                ("cargo_env_path_link", path),
+                ("cargo_env_link_target", &target),
+            ] {
+                let value = value.as_os_str().as_encoded_bytes();
+                let value = if normalize {
+                    environment.normalize(value)
+                } else {
+                    value.to_vec()
+                };
+                fold(hasher, label, &value);
+            }
+        }
+    }
+    for path in outside::dependency_inputs(&environment.dependency_roots) {
+        let identity = path.as_os_str().as_encoded_bytes();
+        let identity = if normalize {
+            environment.normalize(identity)
+        } else {
+            identity.to_vec()
+        };
+        fold(hasher, "cargo_env_path", &identity);
+        let text = (normalize && environment.within_target_dir(&path)).then_some(environment);
+        let state = input_state_as(&path, &[], file_hasher, budget, 0, text)?;
+        fold(hasher, "cargo_env_path_state", state.as_bytes());
+    }
+    Ok(())
+}
+
 impl Run {
     fn identity(&self) -> String {
         let mut hasher = blake3::Hasher::new();
@@ -1274,30 +1393,17 @@ impl Run {
                 continue;
             }
             match value {
-                Some(value) => fold(&mut hasher, "cargo_env_value", value.as_bytes()),
+                Some(value) => fold(&mut hasher, "cargo_env_value", &value),
                 None => fold(&mut hasher, "cargo_env_absent", b""),
             }
-            // A `links` dependency hands its outputs down as `DEP_*` paths
-            // whose spelling is stable across content changes; what is at the
-            // path is the real input, as Cargo's rerun of dependents implies.
-            if name.starts_with("DEP_")
-                && let Some(raw) = std::env::var_os(&name)
-            {
-                let path = PathBuf::from(raw);
-                if path.is_absolute() && path.exists() {
-                    // Only another script's output, under this target
-                    // directory, can name the checkout; a system directory
-                    // such as `/usr/include` hashes as it always did, and
-                    // keeps its path-keyed memo in every checkout.
-                    let text = self
-                        .environment
-                        .within_target_dir(&path)
-                        .then_some(&self.environment);
-                    let state = input_state_as(&path, &[], &file_hasher, &mut budget, 0, text)?;
-                    fold(&mut hasher, "cargo_env_path_state", state.as_bytes());
-                }
-            }
         }
+        fold_dependency_inputs(
+            &mut hasher,
+            &self.environment,
+            &file_hasher,
+            &mut budget,
+            true,
+        )?;
         for name in &prediction.env {
             fold(&mut hasher, "env_name", name.as_bytes());
             match std::env::var_os(name) {
@@ -1387,14 +1493,26 @@ impl Run {
         let manifest: Manifest =
             serde_json::from_slice(&std::fs::read(self.store.blob_path(&manifest.hash))?)?;
         anyhow::ensure!(
-            matches!(manifest.version, 1..=outside::MANIFEST_VERSION),
+            matches!(manifest.version, 1..=rooted_links::MANIFEST_VERSION),
             "unsupported build-script manifest"
         );
-        let rewritten: BTreeSet<&str> = manifest.rewritten.iter().map(String::as_str).collect();
-        let out_dir = &self.environment.out_dir;
+        // Also guard legacy entries before touching the current output tree.
+        outside::validate_named_paths(
+            &self.environment.denormalize_str(&manifest.stdout),
+            &self.environment,
+        )?;
+        rooted_links::validate_manifest(&manifest)?;
         // The recorded run started from an empty OUT_DIR (see `record`), so
         // the restored state is exact only if this one does too.
-        clear_directory(out_dir)?;
+        clear_directory(&self.environment.out_dir)?;
+        finish_restore(self.restore_outputs(meta, &manifest), || {
+            clear_directory(&self.environment.out_dir)
+        })
+    }
+
+    fn restore_outputs(&self, meta: &EntryMeta, manifest: &Manifest) -> Result<u64> {
+        let rewritten: BTreeSet<&str> = manifest.rewritten.iter().map(String::as_str).collect();
+        let out_dir = &self.environment.out_dir;
         for directory in &manifest.directories {
             std::fs::create_dir_all(out_dir.join(checked_relative(directory)?))?;
         }
@@ -1448,7 +1566,11 @@ impl Run {
         for symlink in &manifest.symlinks {
             restore_symlink(out_dir, symlink)?;
         }
-        size += outside::restore(&self.store, &self.environment, meta, &manifest, &rewritten)?;
+        for symlink in &manifest.rooted_symlinks {
+            rooted_links::restore(&self.environment, symlink)?;
+        }
+        rooted_links::validate_restored_relative(&self.environment, &manifest.symlinks)?;
+        size += outside::restore(&self.store, &self.environment, meta, manifest, &rewritten)?;
         replay(
             &self.environment.denormalize(manifest.stdout.as_bytes()),
             &self.environment.denormalize(manifest.stderr.as_bytes()),
@@ -1564,8 +1686,10 @@ impl Run {
             directories: manifest_dirs,
             empty_files,
             symlinks,
-        } = collect_out_dir(&self.environment.out_dir)?;
-        let (used_bytes, used_entries) = outside::out_dir_share(&files, &symlinks)?;
+            rooted_symlinks,
+        } = collect_out_dir_with_environment(&self.environment, MAX_OUT_DIR_FILES)?;
+        let (used_bytes, used_entries) =
+            outside::out_dir_share(&files, &symlinks, rooted_symlinks.len())?;
         let mut outside_outputs =
             outside::collect(stdout_text, &self.environment, used_bytes, used_entries)?;
         let has_outside = !outside_outputs.is_empty();
@@ -1599,14 +1723,15 @@ impl Run {
             // Version 1 would restore placeholders verbatim, version 2 would
             // leave symlinks out, and version 3 would replay a link search
             // without the files it names outside OUT_DIR.
-            version: outside::manifest_version(
-                !symlinks.is_empty(),
-                !rewritten.is_empty(),
-                has_outside,
-            ),
+            version: if rooted_symlinks.is_empty() {
+                outside::manifest_version(!symlinks.is_empty(), !rewritten.is_empty(), has_outside)
+            } else {
+                rooted_links::MANIFEST_VERSION
+            },
             directories: manifest_dirs,
             empty_files,
             symlinks,
+            rooted_symlinks,
             stdout: String::from_utf8_lossy(&self.environment.normalize(stdout)).into_owned(),
             stderr: String::from_utf8_lossy(&self.environment.normalize(stderr)).into_owned(),
             rewritten,
@@ -1725,6 +1850,10 @@ struct Manifest {
     /// Symlinks that stay inside `OUT_DIR` (version 3).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     symlinks: Vec<Symlink>,
+    /// Links whose targets are checked suffixes of the run's allowed roots.
+    /// Version 5 keeps older readers from silently omitting these links.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    rooted_symlinks: Vec<RootedSymlink>,
     /// Directories under the target directory, outside `OUT_DIR`, that the
     /// script named. Version 4. Absent on a manifest written before that.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1838,18 +1967,37 @@ struct OutDirContents {
     directories: Vec<String>,
     empty_files: Vec<EmptyFile>,
     symlinks: Vec<Symlink>,
+    rooted_symlinks: Vec<RootedSymlink>,
 }
 
+#[cfg(test)]
 fn collect_out_dir(out_dir: &Path) -> Result<OutDirContents> {
     collect_out_dir_capped(out_dir, MAX_OUT_DIR_FILES)
 }
 
 /// [`collect_out_dir`] with `max_entries` for its file and symlink cap.
+#[cfg(test)]
 fn collect_out_dir_capped(out_dir: &Path, max_entries: usize) -> Result<OutDirContents> {
+    collect_out_dir_inner(out_dir, max_entries, None)
+}
+
+fn collect_out_dir_with_environment(
+    environment: &Environment,
+    max_entries: usize,
+) -> Result<OutDirContents> {
+    collect_out_dir_inner(&environment.out_dir, max_entries, Some(environment))
+}
+
+fn collect_out_dir_inner(
+    out_dir: &Path,
+    max_entries: usize,
+    environment: Option<&Environment>,
+) -> Result<OutDirContents> {
     let mut files = Vec::new();
     let mut directories = Vec::new();
     let mut empty = Vec::new();
     let mut symlinks = Vec::new();
+    let mut rooted_symlinks = Vec::new();
     let mut total = 0u64;
     let mut pending = vec![out_dir.to_path_buf()];
     while let Some(directory) = pending.pop() {
@@ -1866,21 +2014,32 @@ fn collect_out_dir_capped(out_dir: &Path, max_entries: usize) -> Result<OutDirCo
             if metadata.file_type().is_symlink() {
                 let target = std::fs::read_link(&path)?;
                 anyhow::ensure!(
-                    link_stays_inside(Path::new(&relative), &target),
-                    "OUT_DIR contains a symlink that is absolute or leaves it: {relative} -> {}",
-                    target.display()
-                );
-                anyhow::ensure!(
-                    files.len() + symlinks.len() < max_entries,
+                    files.len() + symlinks.len() + rooted_symlinks.len() < max_entries,
                     "OUT_DIR is too large to record"
                 );
-                symlinks.push(Symlink {
-                    target: target
-                        .to_str()
-                        .context("OUT_DIR symlink target is not UTF-8")?
-                        .to_string(),
-                    name: relative,
-                });
+                if link_stays_inside(Path::new(&relative), &target)
+                    && match environment {
+                        Some(environment) => {
+                            rooted_links::relative_target_is_internal(environment, &path, &target)?
+                        }
+                        None => true,
+                    }
+                {
+                    symlinks.push(Symlink {
+                        target: target
+                            .to_str()
+                            .context("OUT_DIR symlink target is not UTF-8")?
+                            .to_string(),
+                        name: relative,
+                    });
+                } else if let Some(environment) = environment {
+                    rooted_symlinks.push(rooted_links::record(environment, &path, relative)?);
+                } else {
+                    anyhow::bail!(
+                        "OUT_DIR contains a symlink that is absolute or leaves it: {relative} -> {}",
+                        target.display()
+                    );
+                }
             } else if metadata.is_dir() {
                 directories.push(relative);
                 pending.push(path);
@@ -1894,7 +2053,8 @@ fn collect_out_dir_capped(out_dir: &Path, max_entries: usize) -> Result<OutDirCo
                 }
                 total += metadata.len();
                 anyhow::ensure!(
-                    total <= MAX_OUT_DIR_BYTES && files.len() + symlinks.len() < max_entries,
+                    total <= MAX_OUT_DIR_BYTES
+                        && files.len() + symlinks.len() + rooted_symlinks.len() < max_entries,
                     "OUT_DIR is too large to record"
                 );
                 files.push((path, format!("{OUT_PREFIX}{relative}")));
@@ -1908,6 +2068,7 @@ fn collect_out_dir_capped(out_dir: &Path, max_entries: usize) -> Result<OutDirCo
         directories,
         empty_files: empty,
         symlinks,
+        rooted_symlinks,
     })
 }
 
@@ -2037,6 +2198,9 @@ mod tests {
             spellings: mappings.clone(),
             mappings,
             base_dirs: Vec::new(),
+            dependency_roots: Vec::new(),
+            target: None,
+            ownership_roots: Vec::new(),
         }
     }
 
@@ -2083,6 +2247,9 @@ mod tests {
             ],
             spellings: Vec::new(),
             base_dirs: Vec::new(),
+            dependency_roots: Vec::new(),
+            target: None,
+            ownership_roots: Vec::new(),
         };
         let excluded = package_exclusions(package, &environment);
         assert_eq!(
@@ -2097,36 +2264,48 @@ mod tests {
     }
 
     #[test]
-    fn target_dir_strips_the_unit_profile_and_triple() {
-        let _lock = crate::test_support::process_state_test_lock();
-        // SAFETY: the process-state lock serialises environment edits.
-        unsafe { std::env::remove_var("TARGET") };
+    fn target_dir_strips_the_unit_profile_and_captured_target() {
         assert_eq!(
-            target_dir(Path::new("/t/debug/build/pkg-1/out")),
+            target_dir_for(Path::new("/t/debug/build/pkg-1/out"), None),
+            Some(PathBuf::from("/t"))
+        );
+        for target in [
+            "x86_64-unknown-linux-gnu",
+            "wasm32-wasip1",
+            "wasm32-wasip2",
+            "wasm32v1-none",
+            "board",
+        ] {
+            for unit in ["pkg-0123456789abcdef", "pkg/0123456789abcdef"] {
+                let path = PathBuf::from(format!("/t/{target}/debug/build/{unit}/out"));
+                assert_eq!(
+                    target_dir_for(&path, None),
+                    Some(PathBuf::from(format!("/t/{target}"))),
+                    "without a target name the triple prefix stays"
+                );
+                assert_eq!(
+                    target_dir_for(&path, Some(OsStr::new(target))),
+                    Some(PathBuf::from("/t"))
+                );
+                assert_eq!(
+                    target_dir_for(&path, Some(OsStr::new("another-target"))),
+                    Some(PathBuf::from(format!("/t/{target}"))),
+                    "a different captured target must not strip this prefix"
+                );
+            }
+        }
+        assert_eq!(
+            target_dir_for(
+                Path::new("/t/debug/build/pkg-1/out"),
+                Some(OsStr::new("board"))
+            ),
             Some(PathBuf::from("/t"))
         );
         assert_eq!(
-            target_dir(Path::new(
-                "/t/x86_64-unknown-linux-gnu/debug/build/pkg-1/out"
-            )),
-            Some(PathBuf::from("/t/x86_64-unknown-linux-gnu")),
-            "without TARGET the triple directory is not stripped"
+            target_dir_for(Path::new("/t/debug/other/pkg-1/out"), None),
+            None
         );
-        unsafe { std::env::set_var("TARGET", "x86_64-unknown-linux-gnu") };
-        assert_eq!(
-            target_dir(Path::new(
-                "/t/x86_64-unknown-linux-gnu/debug/build/pkg-1/out"
-            )),
-            Some(PathBuf::from("/t"))
-        );
-        assert_eq!(
-            target_dir(Path::new("/t/debug/build/pkg-1/out")),
-            Some(PathBuf::from("/t")),
-            "a profile directory that is not the triple is kept"
-        );
-        unsafe { std::env::remove_var("TARGET") };
-        assert_eq!(target_dir(Path::new("/t/debug/other/pkg-1/out")), None);
-        assert_eq!(target_dir(Path::new("out")), None);
+        assert_eq!(target_dir_for(Path::new("out"), None), None);
     }
 
     #[test]
@@ -2176,13 +2355,13 @@ mod tests {
                 }
             }
         }
-        assert_eq!(vars["CARGO_PKG_NAME"].as_deref(), Some("kt"));
+        assert_eq!(vars["CARGO_PKG_NAME"].as_deref(), Some(b"kt".as_slice()));
         assert_eq!(
             vars["DEP_Z_INCLUDE"].as_deref(),
-            Some("/t/debug/build/z-1/out/include"),
+            Some(b"/t/debug/build/z-1/out/include".as_slice()),
             "values outside a mapped root stay verbatim"
         );
-        assert_eq!(vars["CARGO_CFG_UNIX"].as_deref(), Some(""));
+        assert_eq!(vars["CARGO_CFG_UNIX"].as_deref(), Some(b"".as_slice()));
         assert!(
             vars.contains_key("TARGET"),
             "fixed names are listed even when unset"
@@ -3389,49 +3568,183 @@ mod tests {
         assert_eq!(run.prediction().unwrap(), Some(current));
     }
 
-    /// A `links` dependency hands its outputs down as `DEP_*` paths. What is
-    /// at an absolute path is part of the key; a relative or missing value
-    /// contributes its spelling only.
+    /// A dependency path captured before execution keys its current contents,
+    /// including the transition from an absent file to a present one.
     #[test]
-    fn dep_paths_are_keyed_by_content_only_when_absolute_and_present() {
-        let mut lock = crate::test_support::process_state_test_lock();
-        let dir = lock.enter();
-        let config = crate::test_support::test_config(dir.as_path().join("cache"));
+    fn captured_dependency_paths_are_keyed_by_content_and_presence() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let absolute = dir.path().join("include.h");
+        let mut environment = environment(&dir.path().join("out"), &dir.path().join("pkg"));
+        environment.dependency_roots = outside::dependency_roots([
+            ("DEP_KT_INCLUDE".into(), absolute.clone().into_os_string()),
+            ("DEP_RELATIVE".into(), "relative.h".into()),
+        ]);
         let run = Run {
             store: Store::open(&config).unwrap(),
-            config: config.clone(),
+            config,
             binary_hash: "aaaa".to_string(),
-            environment: environment(&dir.as_path().join("out"), &dir.as_path().join("pkg")),
+            environment,
             start: std::time::Instant::now(),
         };
-        let prediction = Prediction {
-            version: PREDICTION_SCHEMA,
-            inputs: Vec::new(),
-            env: Vec::new(),
-            default_package: false,
-            portable_out_dir: true,
-            embedded_roots: None,
-            rewrites_text: false,
+        let prediction = prediction_with(Some(Vec::new()), true);
+        let keys = || {
+            [
+                run.action_key_with(&prediction, None, &ToolSnapshot::new())
+                    .unwrap(),
+                hermetic::key(&run, &prediction, Path::new("debug/build/x-1/out")).unwrap(),
+            ]
         };
-        let absolute = dir.as_path().join("include.h");
+        let absent = keys();
         std::fs::write(&absolute, "one").unwrap();
-        std::fs::write(dir.as_path().join("relative.h"), "one").unwrap();
-        // SAFETY: the process-state lock serialises environment edits.
-        unsafe { std::env::set_var("DEP_KT_INCLUDE", &absolute) };
-        let before = run.action_key(&prediction).unwrap();
+        let before = keys();
+        for (absent, before) in absent.iter().zip(&before) {
+            assert_ne!(absent, before, "an absent dependency path becomes present");
+        }
         std::fs::write(&absolute, "two").unwrap();
-        let after = run.action_key(&prediction).unwrap();
-        assert_ne!(
-            before, after,
-            "the file behind an absolute DEP_ path is keyed"
-        );
+        let after = keys();
+        for (before, after) in before.iter().zip(&after) {
+            assert_ne!(
+                before, after,
+                "the file behind an absolute DEP_ path is keyed"
+            );
+        }
+        std::fs::write(dir.path().join("relative.h"), "unrelated").unwrap();
+        assert_eq!(after, keys());
+    }
 
-        unsafe { std::env::set_var("DEP_KT_INCLUDE", "relative.h") };
-        let before = run.action_key(&prediction).unwrap();
-        std::fs::write(dir.as_path().join("relative.h"), "two").unwrap();
-        let after = run.action_key(&prediction).unwrap();
-        assert_eq!(before, after, "a relative value is only a spelling");
-        unsafe { std::env::remove_var("DEP_KT_INCLUDE") };
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_dependency_values_are_distinct_in_both_action_keys() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let _lock = crate::test_support::process_state_test_lock();
+        let directory = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(directory.path().join("cache"));
+        let run = Run {
+            store: Store::open(&config).unwrap(),
+            config,
+            binary_hash: "script".into(),
+            environment: environment(
+                &directory.path().join("out"),
+                &directory.path().join("package"),
+            ),
+            start: std::time::Instant::now(),
+        };
+        let prediction = prediction_with(Some(Vec::new()), true);
+        let saved = std::env::var_os("DEP_KT_BINARY_METADATA");
+        let keys = [0xfe, 0xff].map(|byte| {
+            let mut value = b"metadata-".to_vec();
+            value.push(byte);
+            // SAFETY: the process-state lock serialises environment edits.
+            unsafe {
+                std::env::set_var(
+                    "DEP_KT_BINARY_METADATA",
+                    std::ffi::OsString::from_vec(value),
+                );
+            }
+            [
+                run.action_key_with(&prediction, None, &ToolSnapshot::new())
+                    .unwrap(),
+                hermetic::key(&run, &prediction, Path::new("debug/build/x-1/out")).unwrap(),
+            ]
+        });
+        unsafe {
+            match saved {
+                Some(value) => std::env::set_var("DEP_KT_BINARY_METADATA", value),
+                None => std::env::remove_var("DEP_KT_BINARY_METADATA"),
+            }
+        }
+        for (a, b) in keys[0].iter().zip(&keys[1]) {
+            assert_ne!(
+                a, b,
+                "non-UTF-8 dependency metadata is an environment input"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dependency_aliases_share_one_digest_and_budget_but_retargeting_changes_it() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(directory.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let mut env = checkout_environment(
+            &directory.path().join("target"),
+            &directory.path().join("cargo"),
+        );
+        let provider = directory.path().join("target/debug/build/z-1/out");
+        std::fs::create_dir_all(&provider).unwrap();
+        std::fs::write(provider.join("header.h"), "header").unwrap();
+        let alias = directory.path().join("alias");
+        symlink(&provider, &alias).unwrap();
+        env.dependency_roots =
+            outside::dependency_roots([("DEP_Z_ROOT".into(), alias.clone().into_os_string())]);
+        assert_eq!(
+            env.dependency_roots.len(),
+            2,
+            "keep aliases for ownership checks"
+        );
+        let digest = |env: &Environment, normalize, mut budget| {
+            let mut hasher = blake3::Hasher::new();
+            fold_dependency_inputs(
+                &mut hasher,
+                env,
+                &store.file_hasher(),
+                &mut budget,
+                normalize,
+            )?;
+            Ok::<_, anyhow::Error>((hasher.finalize(), budget))
+        };
+        let mut canonical = env.clone();
+        canonical.dependency_roots = vec![provider.canonicalize().unwrap()];
+        for normalize in [true, false] {
+            let (with_alias, remaining) = digest(&env, normalize, 2).unwrap();
+            assert_eq!(remaining, 0, "one directory and one file");
+            assert_ne!(
+                with_alias,
+                digest(&canonical, normalize, 2).unwrap().0,
+                "a dependency symlink's own text is an input"
+            );
+            let bridge = directory.path().join(format!("bridge-{normalize}"));
+            symlink(&provider, &bridge).unwrap();
+            std::fs::remove_file(&alias).unwrap();
+            symlink(&bridge, &alias).unwrap();
+            assert_ne!(
+                with_alias,
+                digest(&env, normalize, 2).unwrap().0,
+                "another link chain to the same bytes can change readlink outputs"
+            );
+            std::fs::remove_file(&alias).unwrap();
+            symlink(&provider, &alias).unwrap();
+            assert!(
+                digest(&env, normalize, 1).is_err(),
+                "the input still uses its budget"
+            );
+            let other = directory.path().join(format!("other-{normalize}"));
+            std::fs::create_dir(&other).unwrap();
+            std::fs::write(other.join("header.h"), "header").unwrap();
+            let mut moved = env.clone();
+            moved.dependency_roots = vec![other.clone()];
+            assert_ne!(
+                with_alias,
+                digest(&moved, normalize, 2).unwrap().0,
+                "equal bytes at a different input root can change realpath outputs"
+            );
+            std::fs::remove_file(&alias).unwrap();
+            symlink(&other, &alias).unwrap();
+            assert_ne!(with_alias, digest(&env, normalize, 4).unwrap().0);
+            std::fs::remove_file(&alias).unwrap();
+            symlink(&provider, &alias).unwrap();
+        }
+        assert_ne!(
+            digest(&env, true, 2).unwrap().0,
+            digest(&env, false, 2).unwrap().0,
+            "hermetic runs retain the input root they see"
+        );
     }
 
     /// A run's roots in one target directory: `<target>/debug/build/x/out`,
@@ -3440,6 +3753,8 @@ mod tests {
         let out_dir = target.join("debug/build/x-1/out");
         let manifest_dir = cargo_home.join("registry/src/x-1.0.0");
         std::fs::create_dir_all(&out_dir).unwrap();
+        // Cargo creates source roots before the run captures their aliases.
+        std::fs::create_dir_all(&manifest_dir).unwrap();
         let mut mappings = vec![
             (out_dir.clone(), "${KACHE_OUT_DIR}"),
             (manifest_dir.clone(), "${KACHE_MANIFEST_DIR}"),
@@ -3447,12 +3762,25 @@ mod tests {
             (cargo_home.to_path_buf(), "${KACHE_CARGO_HOME}"),
         ];
         mappings.sort_by_key(|(root, _)| std::cmp::Reverse(root.as_os_str().len()));
+        let spellings = mappings.clone();
+        let aliases: Vec<_> = mappings
+            .iter()
+            .filter_map(|(root, placeholder)| {
+                let canonical = root.canonicalize().ok()?;
+                (canonical != *root).then_some((canonical, *placeholder))
+            })
+            .collect();
+        mappings.extend(aliases);
+        mappings.sort_by_key(|(root, _)| std::cmp::Reverse(root.as_os_str().len()));
         Environment {
             out_dir,
             manifest_dir,
-            spellings: mappings.clone(),
+            spellings,
             mappings,
             base_dirs: Vec::new(),
+            dependency_roots: Vec::new(),
+            target: None,
+            ownership_roots: Vec::new(),
         }
     }
 
@@ -3635,9 +3963,16 @@ mod tests {
         std::fs::create_dir(&dep).unwrap();
         std::fs::write(dep.join("z.h"), b"1").unwrap();
         unsafe { std::env::set_var("DEP_Y_ROOT", &dep) };
-        let with_dep = declared_key();
+        let mut dependent = run("a/target", "cargo");
+        dependent.environment.dependency_roots =
+            outside::dependency_roots([("DEP_Y_ROOT".into(), dep.clone().into_os_string())]);
+        let with_dep = hermetic::key(&dependent, &declared, below).unwrap();
         std::fs::write(dep.join("z.h"), b"2").unwrap();
-        assert_ne!(declared_key(), with_dep, "what a DEP_ path holds");
+        assert_ne!(
+            hermetic::key(&dependent, &declared, below).unwrap(),
+            with_dep,
+            "what a captured DEP_ path holds"
+        );
         unsafe {
             std::env::remove_var("DEP_Y_ROOT");
             std::env::remove_var("KACHE_TEST_HERMETIC_VAR");
@@ -3674,6 +4009,9 @@ mod tests {
                 environment: checkout_environment(&target, &dir.as_path().join("cargo")),
                 start: std::time::Instant::now(),
             };
+            let mut run = run;
+            run.environment.dependency_roots =
+                outside::dependency_roots([("DEP_KT_ROOT".into(), root.clone().into_os_string())]);
             // SAFETY: the process-state lock serialises environment edits.
             unsafe { std::env::set_var("DEP_KT_ROOT", &root) };
             let key = run.action_key(&prediction).unwrap();
@@ -3777,6 +4115,391 @@ mod tests {
             .unwrap();
         serde_json::from_slice(&std::fs::read(run.store.blob_path(&manifest.hash)).unwrap())
             .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cxx_source_links_restore_in_a_new_checkout_and_cargo_home() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let config = crate::test_support::test_config(dir.as_path().join("cache"));
+        let make_run = |name: &str| {
+            let environment = checkout_environment(
+                &dir.as_path().join(name).join("target"),
+                &dir.as_path().join(name).join("cargo"),
+            );
+            std::fs::create_dir_all(environment.manifest_dir.join("src")).unwrap();
+            std::fs::write(environment.manifest_dir.join("build.rs"), "fn main() {}").unwrap();
+            std::fs::write(environment.manifest_dir.join("src/main.rs"), "source").unwrap();
+            let header = dir
+                .as_path()
+                .join(name)
+                .join("cargo/registry/src/cxx/include/cxx.h");
+            std::fs::create_dir_all(header.parent().unwrap()).unwrap();
+            std::fs::write(header, "cxx header").unwrap();
+            Run {
+                store: Store::open(&config).unwrap(),
+                config: config.clone(),
+                binary_hash: "same-script".into(),
+                environment,
+                start: std::time::Instant::now(),
+            }
+        };
+        let a = make_run("a");
+        let out = &a.environment.out_dir;
+        for path in [
+            "cxxbridge/crate",
+            "cxxbridge/include/rust",
+            "cxxbridge/include/demo/src",
+        ] {
+            std::fs::create_dir_all(out.join(path)).unwrap();
+        }
+        std::fs::write(
+            out.join("cxxbridge/include/demo/src/main.rs.h"),
+            "generated header",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            &a.environment.manifest_dir,
+            out.join("cxxbridge/crate/demo"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            dir.as_path().join("a/cargo/registry/src/cxx/include/cxx.h"),
+            out.join("cxxbridge/include/rust/cxx.h"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            out.join("cxxbridge/include/demo/src/main.rs.h"),
+            out.join("absolute-internal.h"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("main.rs.h", out.join("cxxbridge/include/demo/src/main.rs"))
+            .unwrap();
+        // A relative link which climbs out to the package is rooted too.
+        let mut relative = relative_to_ancestor(out, &dir.as_path().join("a")).unwrap();
+        relative.push_str("cargo/registry/src/x-1.0.0");
+        std::os::unix::fs::symlink(relative, out.join("relative-package")).unwrap();
+        let after = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        a.record(b"cargo:rerun-if-changed=build.rs\n", b"", 5, after)
+            .unwrap();
+        let prediction = a.prediction().unwrap().unwrap();
+        let meta = a
+            .store
+            .get(&a.action_key(&prediction).unwrap())
+            .unwrap()
+            .unwrap();
+        let manifest = stored_manifest(&a, &meta);
+        assert_eq!(manifest.version, 5);
+        assert_eq!(manifest.rooted_symlinks.len(), 4);
+        assert_eq!(manifest.symlinks.len(), 1);
+        let b = make_run("b");
+        assert_eq!(
+            a.action_key(&prediction).unwrap(),
+            b.action_key(&prediction).unwrap()
+        );
+        std::fs::remove_dir_all(dir.as_path().join("a")).unwrap();
+        b.restore(&meta).unwrap();
+        let out = &b.environment.out_dir;
+        assert_eq!(
+            std::fs::read(out.join("cxxbridge/crate/demo/src/main.rs")).unwrap(),
+            b"source"
+        );
+        assert_eq!(
+            std::fs::read(out.join("relative-package/src/main.rs")).unwrap(),
+            b"source"
+        );
+        assert_eq!(
+            std::fs::read(out.join("cxxbridge/include/rust/cxx.h")).unwrap(),
+            b"cxx header"
+        );
+        assert_eq!(
+            std::fs::read(out.join("absolute-internal.h")).unwrap(),
+            b"generated header"
+        );
+        assert_eq!(
+            std::fs::read_link(out.join("cxxbridge/include/demo/src/main.rs")).unwrap(),
+            Path::new("main.rs.h")
+        );
+    }
+
+    #[test]
+    fn captured_targets_refuse_legacy_link_paths_and_owned_artifact_restore() {
+        for target_name in ["wasm32-wasip2", "board"] {
+            for unit in ["dep-0123456789abcdef", "dep/0123456789abcdef"] {
+                let directory = tempfile::tempdir().unwrap();
+                let (mut a, mut b) = two_targets(directory.path());
+                a.environment.target = Some(target_name.into());
+                b.environment.target = Some(target_name.into());
+                let relative = format!("{target_name}/debug/build/{unit}/out/libdemo.a");
+                let json = serde_json::json!({"version":4, "directories":[], "empty_files":[], "stdout":format!("cargo:rustc-link-search=${{KACHE_TARGET_DIR}}/{relative}\n"), "stderr":""});
+                let meta = put_manifest(&a, "target-owned-search", &json.to_string());
+                std::fs::write(b.environment.out_dir.join("untouched"), "keep").unwrap();
+                let error = b.restore(&meta).unwrap_err().to_string();
+                assert!(error.contains("not provided by DEP_*"), "{error}");
+                assert_eq!(
+                    std::fs::read(b.environment.out_dir.join("untouched")).unwrap(),
+                    b"keep",
+                    "link-path refusal must precede output cleanup"
+                );
+
+                // A cached outside artifact must pass the same captured-target
+                // ownership check even if its stdout names no search path.
+                let manifest_path = directory.path().join(MANIFEST_NAME);
+                std::fs::write(
+                    &manifest_path,
+                    r#"{"version":4,"directories":[],"empty_files":[],"stdout":"","stderr":""}"#,
+                )
+                .unwrap();
+                let library = directory.path().join("library.a");
+                std::fs::write(&library, "archive").unwrap();
+                a.store
+                    .put_with_compile_time_independent(
+                        "target-owned-artifact",
+                        CRATE_NAME,
+                        &["build-script".into()],
+                        &[],
+                        "",
+                        "",
+                        &[
+                            (manifest_path, MANIFEST_NAME.into()),
+                            (library, format!("outside/{relative}")),
+                        ],
+                        "",
+                        "",
+                        0,
+                    )
+                    .unwrap();
+                let meta = a.store.get("target-owned-artifact").unwrap().unwrap();
+                let error = b.restore(&meta).unwrap_err().to_string();
+                assert!(error.contains("cargo directory"), "{error}");
+                assert!(
+                    !directory.path().join("b/target").join(relative).exists(),
+                    "a refused artifact must not overwrite a Cargo unit"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_profile_and_triple_link_paths_are_refused_before_restore_writes() {
+        for alias in ["profile", "triple"] {
+            let directory = tempfile::tempdir().unwrap();
+            let target = directory.path().join("target");
+            let physical = directory.path().join("physical/renamed-target");
+            let physical_profile = physical.join("debug");
+            let lexical_triple = target.join("board");
+            std::fs::create_dir_all(&physical_profile).unwrap();
+            std::fs::create_dir_all(&target).unwrap();
+            if alias == "profile" {
+                std::fs::create_dir(&lexical_triple).unwrap();
+                std::os::unix::fs::symlink(&physical_profile, lexical_triple.join("debug"))
+                    .unwrap();
+            } else {
+                std::os::unix::fs::symlink(&physical, &lexical_triple).unwrap();
+            }
+            let out = lexical_triple.join("debug/build/own-0123456789abcdef/out");
+            std::fs::create_dir_all(&out).unwrap();
+            let mut environment = environment(&out, &directory.path().join("package"));
+            environment.target = Some("board".into());
+            environment.ownership_roots =
+                ownership_target_roots(&out, environment.target.as_deref());
+            environment
+                .mappings
+                .push((target.clone(), TARGET_DIR_PLACEHOLDER));
+            environment.spellings.push((target, TARGET_DIR_PLACEHOLDER));
+            let config = crate::test_support::test_config(directory.path().join("cache"));
+            let run = Run {
+                store: Store::open(&config).unwrap(),
+                config,
+                binary_hash: "script".into(),
+                environment,
+                start: std::time::Instant::now(),
+            };
+            let sibling = physical_profile.join("build/dep/0123456789abcdef/out/lib");
+            std::fs::create_dir_all(&sibling).unwrap();
+            let json = serde_json::json!({"version":4, "directories":[], "empty_files":[], "stdout":format!("cargo:rustc-link-search={}\n", sibling.canonicalize().unwrap().display()), "stderr":""});
+            let meta = put_manifest(&run, "canonical-owned-search", &json.to_string());
+            std::fs::write(out.join("untouched"), "keep").unwrap();
+            let error = run.restore(&meta).unwrap_err().to_string();
+            assert!(error.contains("not provided by DEP_*"), "{alias}: {error}");
+            assert_eq!(std::fs::read(out.join("untouched")).unwrap(), b"keep");
+        }
+    }
+
+    #[test]
+    fn sibling_unit_paths_are_refused_before_record_or_legacy_restore() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let (a, b) = two_targets(dir.as_path());
+        let sibling = dir.as_path().join("a/target/debug/build/scratch-1/out/lib");
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("libdemo.a"), "archive").unwrap();
+        let stdout = format!(
+            "cargo:rerun-if-changed=build.rs\ncargo:rustc-link-search={}\n",
+            sibling.display()
+        );
+        let after = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        assert!(
+            a.record(stdout.as_bytes(), b"", 5, after)
+                .unwrap_err()
+                .to_string()
+                .contains("not provided by DEP_*")
+        );
+        for version in 1..=5 {
+            let json = serde_json::json!({"version":version, "directories":[], "empty_files":[], "stdout":"cargo:rustc-link-search=${KACHE_TARGET_DIR}/debug/build/scratch-1/out/lib\n", "stderr":""});
+            let meta = put_manifest(&a, &format!("unsafe-v{version}"), &json.to_string());
+            std::fs::write(b.environment.out_dir.join("untouched"), "keep").unwrap();
+            let error = b.restore(&meta).unwrap_err().to_string();
+            assert!(error.contains("not provided by DEP_*"), "{error}");
+            assert_eq!(
+                std::fs::read(b.environment.out_dir.join("untouched")).unwrap(),
+                b"keep"
+            );
+        }
+        let prediction = prediction_with(Some(Vec::new()), true);
+        let tools = ToolSnapshot::new();
+        assert_ne!(
+            a.action_key_as(b"kache-build-script-action-v2", &prediction, None, &tools)
+                .unwrap(),
+            a.action_key_with(&prediction, None, &tools).unwrap()
+        );
+    }
+
+    #[test]
+    fn completed_restore_keeps_outputs_without_running_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifact = directory.path().join("generated.h");
+        std::fs::write(&artifact, "valid output").unwrap();
+        let value = finish_restore(Ok(12_u64), || {
+            std::fs::remove_file(&artifact)?;
+            anyhow::bail!("cleanup must not run after a successful restore")
+        })
+        .unwrap();
+        assert_eq!(value, 12);
+        assert_eq!(std::fs::read(&artifact).unwrap(), b"valid output");
+    }
+
+    #[test]
+    fn rejected_restore_cleans_outputs_and_preserves_its_error_for_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifact = directory.path().join("rejected-output");
+        std::fs::write(&artifact, "unsafe leftover").unwrap();
+        let calls = std::cell::Cell::new(0);
+        let failed: Result<u64> = Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid cached output",
+        )
+        .into());
+        let error = finish_restore(failed.context("restore rejected"), || {
+            calls.set(calls.get() + 1);
+            clear_directory(directory.path())
+        })
+        .unwrap_err();
+        assert_eq!(calls.get(), 1);
+        assert!(!artifact.exists());
+        assert_eq!(
+            format!("{error:#}"),
+            "restore rejected: invalid cached output"
+        );
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        let mut ran_script = false;
+        let code = cache_bypass_exit_code(&error).unwrap_or_else(|| {
+            ran_script = true;
+            23
+        });
+        assert!(ran_script, "clean output permits the ordinary fallback");
+        assert_eq!(code, 23);
+        continue_after_restore_failure(error).unwrap();
+    }
+
+    #[test]
+    fn failed_restore_cleanup_stays_fatal_through_cache_bypass_context() {
+        let calls = std::cell::Cell::new(0);
+        let failed: Result<u64> = Err(anyhow::anyhow!("restore rejected"));
+        let error = finish_restore(failed, || {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "cleanup denied").into())
+        })
+        .context("restoring cached build script")
+        .unwrap_err();
+        assert_eq!(calls.get(), 1);
+        assert!(error.is::<RestoreCleanupFailed>());
+        assert_eq!(
+            format!("{error:#}"),
+            "restoring cached build script: cannot remove outputs from a rejected build-script restore: cleanup denied"
+        );
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let error = continue_after_restore_failure(error)
+            .context("cache bypass")
+            .unwrap_err();
+        assert!(error.is::<RestoreCleanupFailed>());
+        let mut ran_script = false;
+        let code = cache_bypass_exit_code(&error).unwrap_or_else(|| {
+            ran_script = true;
+            23
+        });
+        assert_eq!(code, 1);
+        assert!(
+            !ran_script,
+            "the real script must not see rejected leftovers"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejected_mixed_link_graphs_leave_no_outputs_for_the_real_script() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = directory.path().join("package");
+        let target = package.join("target");
+        let out = target.join("debug/build/pkg-1/out");
+        std::fs::create_dir_all(&out).unwrap();
+        let mut environment = environment(&out, &package);
+        environment
+            .mappings
+            .push((target.clone(), TARGET_DIR_PLACEHOLDER));
+        environment.spellings.push((target, TARGET_DIR_PLACEHOLDER));
+        let config = crate::test_support::test_config(directory.path().join("cache"));
+        let run = Run {
+            store: Store::open(&config).unwrap(),
+            config,
+            binary_hash: "script".into(),
+            environment,
+            start: std::time::Instant::now(),
+        };
+        std::fs::write(package.join("target/existing"), "untouched").unwrap();
+        for (index, suffix) in [
+            "target/existing",
+            "target/missing",
+            "target/nested/missing",
+            "not-created/nested/header",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let json = serde_json::json!({
+                "version":5, "directories":[], "empty_files":[], "stdout":"", "stderr":"",
+                "symlinks":[{"name":"through", "target":format!("crate/{suffix}")}],
+                "rooted_symlinks":[{"name":"crate", "root":"package", "suffix":""}]
+            });
+            let meta = put_manifest(&run, &format!("mixed-{index}"), &json.to_string());
+            assert!(run.restore(&meta).is_err(), "{suffix}");
+            assert!(
+                directory_is_empty(&out),
+                "rejected links must not reach the fallback script"
+            );
+            assert_eq!(
+                std::fs::read(package.join("target/existing")).unwrap(),
+                b"untouched"
+            );
+        }
     }
 
     /// rdkafka-sys's `make libs` leaves `librdkafka.so -> librdkafka.so.1`
@@ -4113,7 +4836,7 @@ mod tests {
             ),
             start: std::time::Instant::now(),
         };
-        for version in [0, 5] {
+        for version in [0, 6] {
             let meta = put_manifest(
                 &run,
                 &format!("v{version}"),
@@ -4280,6 +5003,7 @@ mod tests {
             stderr: String::new(),
             rewritten: Vec::new(),
             symlinks: vec![link("d/a", ".."), link("d/a/c", "../x")],
+            rooted_symlinks: Vec::new(),
             outside_directories: Vec::new(),
             outside_empty_files: Vec::new(),
             outside_symlinks: Vec::new(),
@@ -4398,6 +5122,11 @@ mod tests {
                 run.environment
                     .within_target_dir(&target.join("debug/build/z-1/out"))
             );
+            let mut run = run;
+            run.environment.dependency_roots = outside::dependency_roots([(
+                "DEP_KT_INCLUDE".into(),
+                system.clone().into_os_string(),
+            )]);
             // SAFETY: the process-state lock serialises environment edits.
             unsafe { std::env::set_var("DEP_KT_INCLUDE", &system) };
             let key = run.action_key(&prediction).unwrap();

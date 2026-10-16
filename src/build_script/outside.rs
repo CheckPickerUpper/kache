@@ -97,12 +97,16 @@ pub(super) fn file_bytes(files: &[(PathBuf, String)]) -> Result<u64> {
 }
 
 /// Bytes and entries `OUT_DIR` already takes from the shared cap: its regular
-/// files, and one entry per symlink.
+/// files, and one entry per relative or rooted symlink.
 pub(super) fn out_dir_share(
     files: &[(PathBuf, String)],
     symlinks: &[Symlink],
+    rooted_symlinks: usize,
 ) -> Result<(u64, usize)> {
-    Ok((file_bytes(files)?, files.len() + symlinks.len()))
+    Ok((
+        file_bytes(files)?,
+        files.len() + symlinks.len() + rooted_symlinks,
+    ))
 }
 
 struct Budget {
@@ -165,7 +169,9 @@ pub(super) fn restore(
     }
     let target = target_spelling(environment)?;
     for directory in &manifest.outside_directories {
-        std::fs::create_dir_all(target.join(checked_outside(directory)?))?;
+        std::fs::create_dir_all(
+            target.join(checked_outside(directory, environment.target.as_deref())?),
+        )?;
     }
     let mut prepared = Vec::new();
     let mut texts = Vec::new();
@@ -174,7 +180,7 @@ pub(super) fn restore(
         let Some(relative) = cached.name.strip_prefix(PREFIX) else {
             continue;
         };
-        let path = target.join(checked_outside(relative)?);
+        let path = target.join(checked_outside(relative, environment.target.as_deref())?);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -204,7 +210,7 @@ pub(super) fn restore(
         set_executable(&path, executable)?;
     }
     for empty in &manifest.outside_empty_files {
-        let path = target.join(checked_outside(&empty.name)?);
+        let path = target.join(checked_outside(&empty.name, environment.target.as_deref())?);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -212,7 +218,7 @@ pub(super) fn restore(
         set_executable(&path, empty.executable)?;
     }
     for symlink in &manifest.outside_symlinks {
-        checked_outside(&symlink.name)?;
+        checked_outside(&symlink.name, environment.target.as_deref())?;
         super::restore_symlink(target, symlink)?;
     }
     Ok(size)
@@ -229,10 +235,10 @@ fn target_spelling(environment: &Environment) -> Result<&Path> {
 
 /// `name` is relative to the target directory and is not one of Cargo's own
 /// profile directories.
-fn checked_outside(name: &str) -> Result<&Path> {
+fn checked_outside<'a>(name: &'a str, target_name: Option<&OsStr>) -> Result<&'a Path> {
     let path = checked_relative(name)?;
     anyhow::ensure!(
-        !is_cargo_owned_relative(path),
+        !is_cargo_owned_relative(path, target_name),
         "recorded build-script output is in a cargo directory: {name}"
     );
     Ok(path)
@@ -257,7 +263,13 @@ fn collect_path(
         );
     }
     if metadata.is_dir() {
-        return walk(target, path, budget, contents);
+        return walk(
+            target,
+            environment.target.as_deref(),
+            path,
+            budget,
+            contents,
+        );
     }
     anyhow::bail!(
         "a named target output is not a file or directory: {}",
@@ -267,6 +279,7 @@ fn collect_path(
 
 fn walk(
     target: &Path,
+    target_name: Option<&OsStr>,
     named: &Path,
     budget: &mut Budget,
     contents: &mut OutsideContents,
@@ -282,7 +295,7 @@ fn walk(
         for entry in entries {
             let path = entry.path();
             let relative = path.strip_prefix(target)?;
-            if is_cargo_owned_relative(relative) {
+            if is_cargo_owned_relative(relative, target_name) {
                 continue;
             }
             let metadata = std::fs::symlink_metadata(&path)?;
@@ -356,6 +369,7 @@ fn record_symlink(
 }
 
 fn paths_to_snapshot(stdout: &str, environment: &Environment) -> Result<Vec<PathBuf>> {
+    validate_named_paths(stdout, environment)?;
     let mut found = Vec::new();
     for raw in named_output_paths(stdout) {
         let Some(path) = resolve_named_path(&raw, environment) else {
@@ -364,7 +378,9 @@ fn paths_to_snapshot(stdout: &str, environment: &Environment) -> Result<Vec<Path
         let Some(relative) = relative_to_target(environment, &path) else {
             continue;
         };
-        if is_inside_out_dir(&path, environment) || is_cargo_owned_relative(relative) {
+        if is_inside_out_dir(&path, environment)
+            || is_cargo_owned_relative(relative, environment.target.as_deref())
+        {
             continue;
         }
         match std::fs::symlink_metadata(&path) {
@@ -377,6 +393,187 @@ fn paths_to_snapshot(stdout: &str, environment: &Environment) -> Result<Vec<Path
         }
     }
     Ok(dedup_nested(found))
+}
+
+/// Absolute dependency metadata paths are inputs provided before this run.
+/// Keep both spellings when a link gives the same input another name.
+pub(super) fn dependency_roots(
+    variables: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for (name, value) in variables {
+        if name.as_encoded_bytes().starts_with(b"DEP_") {
+            let path = PathBuf::from(value);
+            if path.is_absolute() {
+                // Keep the spelling the dependency supplied, not a lexical
+                // simplification: `link/..` can resolve somewhere other than
+                // the parent of `link` when it is a symlink.
+                if let Some(canonical) = canonical_with_missing_suffix(&path) {
+                    roots.push(canonical);
+                }
+                roots.push(path);
+            }
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// Ownership checks need every captured spelling, but hashing those aliases
+/// separately walks and budgets the same dependency more than once.
+pub(super) fn dependency_inputs(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut inputs: Vec<_> = roots
+        .iter()
+        .map(|path| canonical_with_missing_suffix(path).unwrap_or_else(|| path.clone()))
+        .collect();
+    inputs.sort();
+    inputs.dedup();
+    inputs
+}
+
+fn path_aliases(path: &Path) -> Vec<PathBuf> {
+    let mut aliases: Vec<_> = normalize_lexical(path).into_iter().collect();
+    if let Some(canonical) = canonical_with_missing_suffix(path)
+        && !aliases.contains(&canonical)
+    {
+        aliases.push(canonical);
+    }
+    aliases
+}
+
+/// A missing library below an existing symlink still belongs to the unit
+/// that symlink resolves into. Keep the missing suffix without inventing a
+/// new spelling for the existing prefix.
+fn canonical_with_missing_suffix(path: &Path) -> Option<PathBuf> {
+    let mut ancestor = path.to_path_buf();
+    let mut missing = Vec::new();
+    loop {
+        match ancestor.canonicalize() {
+            Ok(mut canonical) => {
+                canonical.extend(missing.iter().rev());
+                return Some(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(ancestor.file_name()?.to_os_string());
+                if !ancestor.pop() {
+                    return None;
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Cargo owns every profile/build unit except this run's OUT_DIR. The
+/// collector skips those directories, so replaying a search there is valid
+/// only when a links dependency handed the path down and its contents key
+/// the run. An ancestor above that dependency unit grants nothing.
+pub(super) fn validate_named_paths(stdout: &str, environment: &Environment) -> Result<()> {
+    for raw in named_output_paths(stdout) {
+        let raw = Path::new(&raw);
+        let absolute = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            environment.manifest_dir.join(raw)
+        };
+        anyhow::ensure!(
+            !absolute
+                .components()
+                .any(|component| component == Component::ParentDir)
+                || canonical_with_missing_suffix(&absolute).is_some(),
+            "a named link path with parent traversal cannot be resolved: {}",
+            absolute.display()
+        );
+        for path in path_aliases(&absolute) {
+            if is_inside_out_dir(&path, environment)
+                || path_aliases(&environment.out_dir)
+                    .iter()
+                    .any(|out| path.starts_with(out))
+            {
+                continue;
+            }
+            for target in environment.target_roots() {
+                for target in path_aliases(target) {
+                    let Ok(relative) = path.strip_prefix(&target) else {
+                        continue;
+                    };
+                    let Some(unit) = build_unit(relative, environment.target.as_deref()) else {
+                        anyhow::ensure!(
+                            !is_cargo_build_root(relative, environment.target.as_deref()),
+                            "a named link path is a Cargo build root without an owned unit: {}",
+                            path.display()
+                        );
+                        continue;
+                    };
+                    let permitted = dependency_provides(&path, &unit, &target, environment);
+                    anyhow::ensure!(
+                        permitted,
+                        "a named link path is in a Cargo build unit not provided by DEP_*: {}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_cargo_build_root(relative: &Path, target_name: Option<&OsStr>) -> bool {
+    let parts: Vec<_> = relative.iter().collect();
+    (parts.len() == 2 && parts[1] == "build")
+        || (parts.len() == 3 && is_target_triple(parts[0], target_name) && parts[2] == "build")
+}
+
+/// A named path and a dependency can reach the same target through different
+/// aliases. Compare matching views of the path and target, preserving the
+/// dependency-unit boundary in each view.
+fn dependency_provides(path: &Path, unit: &Path, target: &Path, environment: &Environment) -> bool {
+    let Some(unit_identity) = canonical_with_missing_suffix(&target.join(unit)) else {
+        return false;
+    };
+    let target_views: Vec<_> = environment.target_roots().flat_map(path_aliases).collect();
+    path_aliases(path).iter().any(|candidate| {
+        environment.dependency_roots.iter().any(|dependency| {
+            candidate.starts_with(dependency)
+                && target_views.iter().any(|target| {
+                    dependency
+                        .strip_prefix(target)
+                        .ok()
+                        .and_then(|relative| build_unit(relative, environment.target.as_deref()))
+                        .and_then(|unit| canonical_with_missing_suffix(&target.join(unit)))
+                        .is_some_and(|identity| identity == unit_identity)
+                })
+        })
+    })
+}
+
+/// The unit's prefix below target in either Cargo layout. Unknown names
+/// below build are treated as legacy units rather than assumed safe.
+fn build_unit(relative: &Path, target_name: Option<&OsStr>) -> Option<PathBuf> {
+    let parts: Vec<_> = relative.iter().collect();
+    let build = if parts.get(1).copied() == Some(OsStr::new("build")) {
+        1
+    } else if parts
+        .first()
+        .copied()
+        .is_some_and(|name| is_target_triple(name, target_name))
+        && parts.get(2).copied() == Some(OsStr::new("build"))
+    {
+        2
+    } else {
+        return None;
+    };
+    parts.get(build + 1)?;
+    let mut end = build + 2;
+    if parts
+        .get(end)
+        .and_then(|part| part.to_str())
+        .is_some_and(crate::cargo_layout::is_unit_hash)
+    {
+        end += 1;
+    }
+    Some(parts[..end].iter().collect())
 }
 
 /// Search paths and linker inputs a script printed. Kinds (`native=`, …) are
@@ -508,13 +705,16 @@ fn is_inside_out_dir(path: &Path, environment: &Environment) -> bool {
 /// and `<target>/<triple>/<profile>/deps`, and the same for `incremental`,
 /// `build`, `.fingerprint`, and `examples`. A `build` directory further down,
 /// under a tree the script created, is not one of these.
-fn is_cargo_owned_relative(relative: &Path) -> bool {
+fn is_cargo_owned_relative(relative: &Path, target_name: Option<&OsStr>) -> bool {
     let names: Vec<&OsStr> = relative.iter().collect();
     if names.get(1).copied().is_some_and(owned_dir) {
         return true;
     }
     names.len() >= 3
-        && names.first().copied().is_some_and(is_target_triple)
+        && names
+            .first()
+            .copied()
+            .is_some_and(|name| is_target_triple(name, target_name))
         && names.get(2).copied().is_some_and(owned_dir)
 }
 
@@ -525,11 +725,14 @@ fn owned_dir(name: &OsStr) -> bool {
     )
 }
 
-/// A rustc target triple has at least two hyphens (`arch-vendor-os`). A
-/// profile name does not, so `my-profile/gn_out/build` stays the script's.
-fn is_target_triple(name: &OsStr) -> bool {
-    name.to_str()
-        .is_some_and(|text| text.matches('-').count() >= 2)
+/// Cargo's captured target name also covers one-hyphen and custom targets.
+/// Keep the standard-triple fallback for other targets in this tree, while
+/// a script's `my-profile/gn_out/build` remains outside Cargo's directories.
+fn is_target_triple(name: &OsStr, target_name: Option<&OsStr>) -> bool {
+    target_name == Some(name)
+        || name
+            .to_str()
+            .is_some_and(|text| text.matches('-').count() >= 2)
 }
 
 fn slash_relative(relative: &Path) -> Result<String> {
@@ -726,8 +929,16 @@ mod tests {
             name: "lib.so".into(),
             target: "lib.so.1".into(),
         }];
-        assert_eq!(out_dir_share(&files, &symlinks).unwrap(), (6, 3));
-        assert_eq!(out_dir_share(&files, &[]).unwrap(), (6, 2));
+        assert_eq!(out_dir_share(&files, &symlinks, 0).unwrap(), (6, 3));
+        assert_eq!(out_dir_share(&files, &[], 0).unwrap(), (6, 2));
+        assert_eq!(out_dir_share(&files, &symlinks, 2).unwrap(), (6, 5));
+        let (bytes, entries) = out_dir_share(&files, &symlinks, 49_997).unwrap();
+        assert_eq!(budget(bytes, entries).unwrap(), ((1 << 30) - 6, 0));
+        let (bytes, entries) = out_dir_share(&files, &symlinks, 49_998).unwrap();
+        assert!(
+            budget(bytes, entries).is_err(),
+            "rooted links share the cap"
+        );
     }
 
     #[test]
@@ -869,6 +1080,9 @@ mod tests {
             spellings: mappings.clone(),
             mappings,
             base_dirs: Vec::new(),
+            dependency_roots: Vec::new(),
+            target: None,
+            ownership_roots: Vec::new(),
         }
     }
 
@@ -877,6 +1091,424 @@ mod tests {
         std::fs::create_dir_all(lib.parent().unwrap()).unwrap();
         std::fs::write(&lib, "arch").unwrap();
         lib
+    }
+
+    #[test]
+    fn a_sibling_build_unit_requires_a_dependency_path_inside_that_unit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = sample_env(dir.path());
+        for relative in [
+            "debug/build/scratch-1/out/lib",
+            "my-custom-profile/build/scratch-1/out/lib",
+            "x86_64-unknown-linux-gnu/release/build/scratch/0123456789abcdef/out/lib",
+        ] {
+            let path = dir.path().join("target").join(relative);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("libdemo.a"), "library").unwrap();
+            let stdout = format!("cargo:rustc-link-search=native={}\n", path.display());
+            assert!(validate_named_paths(&stdout, &env).is_err());
+            assert!(
+                collect(&stdout, &env, 0, 0).is_err(),
+                "record must refuse the whole run"
+            );
+            for broad in ["target", "target/debug/build"] {
+                env.dependency_roots = vec![dir.path().join(broad)];
+                assert!(
+                    validate_named_paths(&stdout, &env).is_err(),
+                    "a DEP path above the unit is not ownership"
+                );
+            }
+            env.dependency_roots = dependency_roots([(
+                "DEP_Z_ROOT".into(),
+                path.parent().unwrap().as_os_str().to_os_string(),
+            )]);
+            validate_named_paths(&stdout, &env).unwrap();
+            assert!(
+                collect(&stdout, &env, 0, 0).unwrap().is_empty(),
+                "the dependency owns this output"
+            );
+            env.dependency_roots = vec![path.join("too-specific")];
+            assert!(validate_named_paths(&stdout, &env).is_err());
+            let flag = format!("cargo:rustc-flags=-Lnative={}\n", path.display());
+            assert!(validate_named_paths(&flag, &env).is_err());
+            env.dependency_roots.clear();
+        }
+        let own = format!("cargo:rustc-link-search={}\n", env.out_dir.display());
+        validate_named_paths(&own, &env).unwrap();
+        let beside_own = env.out_dir.parent().unwrap().join("scratch");
+        let stdout = format!("cargo:rustc-link-arg=-L{}\n", beside_own.display());
+        assert!(
+            validate_named_paths(&stdout, &env).is_err(),
+            "the rest of our Cargo unit is not OUT_DIR"
+        );
+    }
+
+    #[test]
+    fn captured_target_names_keep_cargo_units_out_of_collected_outputs() {
+        for target_name in ["wasm32-wasip1", "wasm32-wasip2", "wasm32v1-none", "board"] {
+            for (unit, other_unit) in [
+                ("dep-0123456789abcdef", "dep-fedcba9876543210"),
+                ("dep/0123456789abcdef", "dep/fedcba9876543210"),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut env = sample_env(directory.path());
+                env.target = Some(target_name.into());
+                let build = directory
+                    .path()
+                    .join("target")
+                    .join(target_name)
+                    .join("debug/build");
+                let dependency = build.join(unit).join("out");
+                let other = build.join(other_unit).join("out/lib");
+                std::fs::create_dir_all(dependency.join("lib")).unwrap();
+                std::fs::create_dir_all(&other).unwrap();
+                std::fs::write(dependency.join("lib/libz.a"), "archive").unwrap();
+                let stdout = format!(
+                    "cargo:rustc-link-search={}\n",
+                    dependency.join("lib").display()
+                );
+                assert!(
+                    validate_named_paths(&stdout, &env).is_err(),
+                    "{target_name}/{unit}"
+                );
+                assert!(collect(&stdout, &env, 0, 0).is_err());
+                let build_stdout = format!("cargo:rustc-link-search={}\n", build.display());
+                assert!(validate_named_paths(&build_stdout, &env).is_err());
+                if unit.contains('/') {
+                    env.dependency_roots = dependency_roots([(
+                        "DEP_CRATE_ROOT".into(),
+                        build.join("dep").into_os_string(),
+                    )]);
+                    assert!(
+                        validate_named_paths(&stdout, &env).is_err(),
+                        "a crate directory above multiple hashes is not a dependency unit"
+                    );
+                }
+                env.dependency_roots =
+                    dependency_roots([("DEP_Z_ROOT".into(), dependency.into_os_string())]);
+                validate_named_paths(&stdout, &env).unwrap();
+                assert!(
+                    collect(&stdout, &env, 0, 0).unwrap().is_empty(),
+                    "Cargo's dependency output is an input, never ours to restore"
+                );
+                let triple_stdout = format!(
+                    "cargo:rustc-link-search={}\n",
+                    directory.path().join("target").join(target_name).display()
+                );
+                assert!(
+                    collect(&triple_stdout, &env, 0, 0)
+                        .unwrap()
+                        .files
+                        .is_empty(),
+                    "walking an enclosing tree must also skip Cargo-owned children"
+                );
+                let other_stdout = format!("cargo:rustc-link-search={}\n", other.display());
+                assert!(
+                    validate_named_paths(&other_stdout, &env).is_err(),
+                    "another hash in the same crate is a different unit"
+                );
+                let standard = directory
+                    .path()
+                    .join("target/aarch64-apple-darwin/release/build/other-0123456789abcdef/out");
+                let standard_stdout = format!("cargo:rustc-link-search={}\n", standard.display());
+                assert!(
+                    validate_named_paths(&standard_stdout, &env).is_err(),
+                    "other standard triples retain their ownership checks when TARGET differs"
+                );
+                assert!(is_cargo_owned_relative(
+                    Path::new(&format!("{target_name}/debug/build/{unit}/out")),
+                    env.target.as_deref()
+                ));
+                assert!(
+                    checked_outside(
+                        &format!("{target_name}/debug/build/{unit}/out/libz.a"),
+                        env.target.as_deref()
+                    )
+                    .is_err()
+                );
+                assert!(
+                    checked_outside("my-profile/gn_out/build/libdemo.a", env.target.as_deref())
+                        .is_ok(),
+                    "script-owned build trees remain supported"
+                );
+                let own = format!("cargo:rustc-link-search={}\n", env.out_dir.display());
+                validate_named_paths(&own, &env).unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_profile_and_triple_siblings_keep_their_cargo_owner() {
+        for alias in ["profile", "triple"] {
+            for (unit, other_unit) in [
+                ("dep-0123456789abcdef", "dep-fedcba9876543210"),
+                ("dep/0123456789abcdef", "dep/fedcba9876543210"),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut env = sample_env(directory.path());
+                let target_name = OsStr::new("wasm32-wasip2");
+                let target = directory.path().join("target");
+                let physical = directory.path().join("physical/renamed-target");
+                let physical_profile = physical.join("debug");
+                let lexical_triple = target.join(target_name);
+                let lexical_profile = lexical_triple.join("debug");
+                std::fs::create_dir_all(&physical_profile).unwrap();
+                if alias == "profile" {
+                    std::fs::create_dir_all(&lexical_triple).unwrap();
+                    std::os::unix::fs::symlink(&physical_profile, &lexical_profile).unwrap();
+                } else {
+                    std::os::unix::fs::symlink(&physical, &lexical_triple).unwrap();
+                }
+                env.out_dir = lexical_profile.join("build/own-0123456789abcdef/out");
+                std::fs::create_dir_all(&env.out_dir).unwrap();
+                env.target = Some(target_name.to_os_string());
+                env.ownership_roots =
+                    super::super::ownership_target_roots(&env.out_dir, env.target.as_deref());
+                env.mappings
+                    .retain(|(_, placeholder)| *placeholder != "${KACHE_OUT_DIR}");
+                env.mappings.push((env.out_dir.clone(), "${KACHE_OUT_DIR}"));
+                let lexical_dependency = lexical_profile.join("build").join(unit).join("out");
+                std::fs::create_dir_all(lexical_dependency.join("lib")).unwrap();
+                std::fs::write(lexical_dependency.join("lib/libz.a"), "archive").unwrap();
+                let canonical_dependency = lexical_dependency.canonicalize().unwrap();
+                for path in [&lexical_dependency, &canonical_dependency] {
+                    let stdout =
+                        format!("cargo:rustc-link-search={}\n", path.join("lib").display());
+                    assert!(
+                        validate_named_paths(&stdout, &env).is_err(),
+                        "{alias}: {}",
+                        path.display()
+                    );
+                    assert!(collect(&stdout, &env, 0, 0).is_err());
+                }
+                let metadata = directory.path().join("metadata-outside-target");
+                std::os::unix::fs::symlink(&canonical_dependency, &metadata).unwrap();
+                env.dependency_roots =
+                    dependency_roots([("DEP_Z_ROOT".into(), metadata.into_os_string())]);
+                for path in [&lexical_dependency, &canonical_dependency] {
+                    let stdout =
+                        format!("cargo:rustc-link-search={}\n", path.join("lib").display());
+                    validate_named_paths(&stdout, &env).unwrap();
+                    assert!(collect(&stdout, &env, 0, 0).unwrap().is_empty());
+                }
+                let other = physical_profile
+                    .join("build")
+                    .join(other_unit)
+                    .join("out/lib");
+                std::fs::create_dir_all(&other).unwrap();
+                let stdout = format!("cargo:rustc-link-search={}\n", other.display());
+                assert!(validate_named_paths(&stdout, &env).is_err());
+                for out in [&env.out_dir, &env.out_dir.canonicalize().unwrap()] {
+                    let stdout = format!("cargo:rustc-link-search={}\n", out.display());
+                    validate_named_paths(&stdout, &env).unwrap();
+                }
+                assert_eq!(
+                    env.normalize_str(canonical_dependency.to_str().unwrap()),
+                    canonical_dependency.to_str().unwrap(),
+                    "ownership views must not change stdout path spelling"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dependency_paths_ignore_relative_metadata_and_keep_absolute_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("target/debug/build/z-1/out");
+        let variables = [
+            ("DEP_Z_ROOT".into(), root.clone().into_os_string()),
+            ("DEP_SAME_ROOT".into(), root.clone().into_os_string()),
+            ("DEP_VERSION".into(), "1.2.3".into()),
+            ("OTHER".into(), dir.path().as_os_str().to_os_string()),
+        ];
+        assert_eq!(dependency_roots(variables), vec![root]);
+        assert_eq!(
+            build_unit(Path::new("debug/build/z-1/out/lib"), None),
+            Some(PathBuf::from("debug/build/z-1"))
+        );
+        assert_eq!(
+            build_unit(Path::new("debug/build/z/0123456789abcdef/out"), None),
+            Some(PathBuf::from("debug/build/z/0123456789abcdef"))
+        );
+        for path in [
+            "debug/build",
+            "debug/deps/lib",
+            "debug/custom/build/x",
+            "debug",
+        ] {
+            assert_eq!(build_unit(Path::new(path), None), None, "{path}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_dependencies_distinguish_missing_paths_from_non_directory_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("regular-file");
+        std::fs::write(&file, "not a directory").unwrap();
+        let blocked = file.join("child");
+        assert_eq!(
+            blocked.canonicalize().unwrap_err().kind(),
+            std::io::ErrorKind::NotADirectory
+        );
+        assert!(
+            canonical_with_missing_suffix(&blocked).is_none(),
+            "a regular file cannot become a missing directory prefix"
+        );
+        assert_eq!(
+            canonical_with_missing_suffix(&directory.path().join("missing/child")),
+            Some(
+                directory
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .join("missing/child")
+            )
+        );
+    }
+
+    #[test]
+    fn a_named_cargo_build_root_refuses_recording_even_if_a_dependency_names_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut env = sample_env(directory.path());
+        for relative in ["debug/build", "x86_64-unknown-linux-gnu/release/build"] {
+            let build = directory.path().join("target").join(relative);
+            std::fs::create_dir_all(&build).unwrap();
+            std::fs::write(build.join("libdemo.a"), "archive").unwrap();
+            let stdout = format!("cargo:rustc-link-search={}\n", build.display());
+            assert!(validate_named_paths(&stdout, &env).is_err());
+            assert!(collect(&stdout, &env, 0, 0).is_err());
+            env.dependency_roots =
+                dependency_roots([("DEP_BROAD_ROOT".into(), build.into_os_string())]);
+            assert!(
+                validate_named_paths(&stdout, &env).is_err(),
+                "a Cargo build root is never a dependency unit"
+            );
+            env.dependency_roots.clear();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dependency_and_named_paths_check_canonical_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = sample_env(dir.path());
+        let sibling = dir.path().join("target/debug/build/z-1/out");
+        std::fs::create_dir_all(sibling.join("lib")).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&sibling, &alias).unwrap();
+        let stdout = format!("cargo:rustc-link-search={}\n", alias.join("lib").display());
+        assert!(
+            validate_named_paths(&stdout, &env).is_err(),
+            "an alias cannot hide a sibling unit"
+        );
+        let missing = format!(
+            "cargo:rustc-link-search={}\n",
+            alias.join("missing/nested").display()
+        );
+        assert!(
+            validate_named_paths(&missing, &env).is_err(),
+            "missing children still belong to the sibling unit"
+        );
+        env.dependency_roots =
+            dependency_roots([("DEP_Z_ROOT".into(), alias.clone().into_os_string())]);
+        assert_eq!(env.dependency_roots.len(), 2);
+        validate_named_paths(&stdout, &env).unwrap();
+        let canonical = format!(
+            "cargo:rustc-link-search={}\n",
+            sibling.join("lib").display()
+        );
+        validate_named_paths(&canonical, &env).unwrap();
+        let lexical = format!(
+            "cargo:rustc-link-search={}/other/../lib\n",
+            sibling.display()
+        );
+        assert!(
+            validate_named_paths(&lexical, &env).is_err(),
+            "a parent traversal through a missing directory cannot resolve"
+        );
+        std::fs::create_dir(sibling.join("other")).unwrap();
+        validate_named_paths(&lexical, &env).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn target_aliases_match_dependency_metadata_without_parent_traversal_grants() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut env = sample_env(directory.path());
+        let target = directory.path().join("target");
+        let physical = directory.path().join("physical-target");
+        std::fs::rename(&target, &physical).unwrap();
+        std::os::unix::fs::symlink(&physical, &target).unwrap();
+        let root = physical.join("debug/build/z-1/out");
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+        let metadata = directory.path().join("dependency-metadata");
+        std::os::unix::fs::symlink(&root, &metadata).unwrap();
+        env.dependency_roots = dependency_roots([("DEP_Z_ROOT".into(), metadata.into_os_string())]);
+        let named = target.join("debug/build/z-1/out/lib");
+        let stdout = format!("cargo:rustc-link-search={}\n", named.display());
+        validate_named_paths(&stdout, &env).unwrap();
+        let other = format!(
+            "cargo:rustc-link-search={}\n",
+            target.join("debug/build/other-1/out/lib").display()
+        );
+        assert!(validate_named_paths(&other, &env).is_err());
+
+        env.dependency_roots = dependency_roots([(
+            "DEP_BROAD_ROOT".into(),
+            target.join("debug/build").into_os_string(),
+        )]);
+        assert!(
+            validate_named_paths(&stdout, &env).is_err(),
+            "an aliased parent of all units grants nothing"
+        );
+
+        let external = directory.path().join("external");
+        std::fs::create_dir_all(external.join("child")).unwrap();
+        std::os::unix::fs::symlink(external.join("child"), root.join("portal")).unwrap();
+        let misleading = root.join("portal/..");
+        env.dependency_roots =
+            dependency_roots([("DEP_MISLEADING_ROOT".into(), misleading.into_os_string())]);
+        assert!(
+            validate_named_paths(&stdout, &env).is_err(),
+            "a lexical parent must not grant the symlink's apparent parent"
+        );
+
+        // A real parent traversal which resolves to this unit is still a
+        // valid DEP path. The canonical value establishes the ownership.
+        env.dependency_roots =
+            dependency_roots([("DEP_Z_ROOT".into(), root.join("lib/..").into_os_string())]);
+        validate_named_paths(&stdout, &env).unwrap();
+
+        env.dependency_roots.clear();
+        std::fs::create_dir_all(root.join("child")).unwrap();
+        std::os::unix::fs::symlink(root.join("child"), env.out_dir.join("portal")).unwrap();
+        let disguised = format!(
+            "cargo:rustc-link-search={}\n",
+            env.out_dir.join("portal/../lib").display()
+        );
+        assert!(
+            validate_named_paths(&disguised, &env).is_err(),
+            "a lexical OUT_DIR path cannot hide a sibling unit"
+        );
+        std::os::unix::fs::symlink(
+            physical.join("debug/build/not-created-1/out/child"),
+            env.out_dir.join("dangling-portal"),
+        )
+        .unwrap();
+        let unresolved = format!(
+            "cargo:rustc-link-search={}\n",
+            env.out_dir.join("dangling-portal/../lib").display()
+        );
+        assert!(
+            validate_named_paths(&unresolved, &env).is_err(),
+            "an unresolved parent traversal is not lexically assumed safe"
+        );
     }
 
     #[test]
@@ -895,11 +1527,9 @@ mod tests {
         let stdout = format!(
             "cargo:rustc-link-search=native={}\n\
              cargo:rustc-link-search=native={}\n\
-             cargo:rustc-link-search=/usr/lib\n\
-             cargo:rustc-link-search={}\n",
+             cargo:rustc-link-search=/usr/lib\n",
             lib.parent().unwrap().display(),
             deps.parent().unwrap().display(),
-            dir.path().join("target/debug/build").display(),
         );
         let contents = collect(&stdout, &env, 0, 0).unwrap();
         assert_eq!(
@@ -957,6 +1587,9 @@ mod tests {
             spellings: mappings.clone(),
             mappings,
             base_dirs: Vec::new(),
+            dependency_roots: Vec::new(),
+            target: None,
+            ownership_roots: Vec::new(),
         };
         let stdout = format!(
             "cargo:rustc-link-search={}\n",
@@ -988,6 +1621,9 @@ mod tests {
             spellings: mappings.clone(),
             mappings,
             base_dirs: Vec::new(),
+            dependency_roots: Vec::new(),
+            target: None,
+            ownership_roots: Vec::new(),
         };
         let stdout = format!(
             "cargo:rustc-link-search={}\n",
@@ -1060,7 +1696,7 @@ mod tests {
 
     #[test]
     fn cargo_owned_detection_matches_profile_directories_only() {
-        let owned = |path: &str| is_cargo_owned_relative(Path::new(path));
+        let owned = |path: &str| is_cargo_owned_relative(Path::new(path), None);
         for name in ["deps", "incremental", "build", ".fingerprint", "examples"] {
             assert!(owned(&format!("debug/{name}")), "{name}");
             assert!(owned(&format!("debug/{name}/nested")), "{name}");
