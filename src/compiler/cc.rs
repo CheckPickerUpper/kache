@@ -292,6 +292,10 @@ enum CcArgAction {
     DepTarget,
     LanguageOverride,
     Include,
+    /// clang-cl `/imsvc`: a system include directory. Its headers reach the
+    /// key through the preprocessor expansion like `-isystem`'s; the
+    /// parser only has to consume the value.
+    SystemInclude,
     Define,
 }
 
@@ -576,6 +580,24 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         bucket: CcArgBucket::Preprocessor,
         source: "include search path",
         dialect: None,
+    },
+    // clang-cl's system include directory, separate or joined. cargo-xwin
+    // passes the CRT and Windows SDK headers this way.
+    CcArgSpec {
+        matcher: Matcher::Prefix("/imsvc"),
+        value_form: CcArgValueForm::CanBeSeparated { prefix: "/imsvc" },
+        action: CcArgAction::SystemInclude,
+        bucket: CcArgBucket::Preprocessor,
+        source: "system include search path",
+        dialect: Some(Dialect::Cl),
+    },
+    CcArgSpec {
+        matcher: Matcher::Prefix("-imsvc"),
+        value_form: CcArgValueForm::CanBeSeparated { prefix: "-imsvc" },
+        action: CcArgAction::SystemInclude,
+        bucket: CcArgBucket::Preprocessor,
+        source: "system include search path",
+        dialect: Some(Dialect::Cl),
     },
     CcArgSpec {
         matcher: Matcher::Prefix("-D"),
@@ -1325,6 +1347,7 @@ fn apply_cc_arg(parsed: &mut CcArgs, depinfo: &mut Option<DepInfoSpec>, arg: &Pa
                 parsed.defines.push(parse_define(value));
             }
         }
+        CcArgAction::SystemInclude => {}
     }
 }
 
@@ -3117,6 +3140,30 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         dialect: None,
     },
     FlagSpec {
+        // clang-cl's `-isystem`: `/imsvc <dir>` or joined. The `/EP`
+        // expansion keeps it, so the headers it finds are in the key.
+        matcher: Matcher::Prefix("/imsvc"),
+        class: FlagClass::PreprocessorCaptured,
+        source: "clang-cl system include directory (cargo-xwin CRT and SDK headers).",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("-imsvc"),
+        class: FlagClass::PreprocessorCaptured,
+        source: "clang-cl system include directory, dash spelling.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        // No linker runs for `-c` or `-E`, but an unused-argument warning
+        // can fail under `-Werror`. Key the spelling so a successful entry
+        // without it cannot hide that failure. cargo-xwin puts
+        // `-fuse-ld=lld-link` in every CFLAGS.
+        matcher: Matcher::Prefix("-fuse-ld="),
+        class: FlagClass::RawKeyed,
+        source: "linker selection; unused-argument diagnostics can change compile success.",
+        dialect: None,
+    },
+    FlagSpec {
         matcher: Matcher::Exact("-iquote"),
         class: FlagClass::PreprocessorCaptured,
         source: "PR #94",
@@ -3893,10 +3940,8 @@ fn classify_and_trace_cc_flags<'a>(
     let mut rejected = Vec::new();
 
     let dialect = parsed.family.dialect();
-    let mut idx = 0;
-    while idx < parsed.rest.len() {
-        let arg = &parsed.rest[idx];
-
+    let mut args = parsed.rest.iter().enumerate();
+    while let Some((idx, arg)) = args.next() {
         // `-Xclang <tok>` forwards `<tok>` straight to the cc1 front end,
         // so the driver-level table can't classify it — `<tok>` means
         // whatever cc1 makes of it (cc1 `-MP` is dep-info phony targets,
@@ -3907,10 +3952,9 @@ fn classify_and_trace_cc_flags<'a>(
         if arg == "-Xclang" {
             // The marker only forwards; it has no object effect itself.
             summary.record(Some(FlagClass::NoObjectEffect));
-            let Some(inner) = parsed.rest.get(idx + 1) else {
+            let Some((_, inner)) = args.next() else {
                 // Trailing `-Xclang` with no operand: nothing to forward.
                 tracing::trace!("[cc:{subject}] flag -Xclang (no operand) -> NoObjectEffect");
-                idx += 1;
                 continue;
             };
             let class = classify_xclang_forwarded(inner, dialect);
@@ -3930,7 +3974,6 @@ fn classify_and_trace_cc_flags<'a>(
                     rejected.push(inner.as_str());
                 }
             }
-            idx += 2;
             continue;
         }
 
@@ -3955,7 +3998,30 @@ fn classify_and_trace_cc_flags<'a>(
                 rejected.push(arg.as_str());
             }
         }
-        idx += 1;
+        if dialect == Dialect::Cl && arg == "--" {
+            // clang-cl reads everything after `--` as an input file, which
+            // the `cc` crate relies on for sources with absolute Unix paths
+            // (`/home/...`) that would otherwise spell flags.
+            // Only the parsed sources are tracked by the compile key.
+            // An extra input such as LLVM IR must not bypass the gate.
+            for (_, input) in args.by_ref() {
+                if !parsed
+                    .sources
+                    .iter()
+                    .any(|source| source.as_os_str() == OsStr::new(input))
+                {
+                    summary.record(None);
+                    tracing::trace!("[cc:{subject}] untracked input after --: {input}");
+                    rejected.push(input.as_str());
+                }
+            }
+            break;
+        }
+        if takes_separate_value(&parsed.rest, idx, dialect)
+            && let Some((_, value)) = args.next()
+        {
+            tracing::trace!("[cc:{subject}] value {value} of {arg} -> consumed by the flag");
+        }
     }
 
     if !parsed.rest.is_empty() {
@@ -4038,6 +4104,18 @@ fn normalize_raw_keyed_cc_flag(arg: &str, prefix_maps: &[CcPrefixMap]) -> Vec<u8
     normalized.push(b'=');
     normalized.extend_from_slice(to.as_bytes());
     normalized
+}
+
+/// Whether `rest[idx]` is a flag that [`CcArgs::parse`] reads together with
+/// the next token as its value (`-I <dir>`, `-o <path>`, `-D <name>`).
+///
+/// That token is the flag's value and is never classified as a flag of its
+/// own. Under clang-cl a token starting with `/` is a flag spelling, so an
+/// absolute Unix path in a separate `-I` value (cargo-xwin and other
+/// clang-cl cross builds) would otherwise read as an unknown flag and refuse
+/// the compile.
+fn takes_separate_value(rest: &[String], idx: usize, dialect: Dialect) -> bool {
+    parse_cc_arg_at(rest, idx, dialect).is_some_and(|arg| arg.consumed == 2)
 }
 
 fn analyze_cc_arg(arg: &str, dialect: Dialect) -> CcArgAnalysis<'_> {
