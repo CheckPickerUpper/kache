@@ -3134,9 +3134,16 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         dialect: None,
     },
     FlagSpec {
-        matcher: Matcher::Exact("-isystem"),
+        // Separated (`-isystem <dir>`) and joined (`-isystem<dir>`) forms:
+        // GCC and clang read both, and build scripts pass the joined one
+        // through `cc::Build::flag`. Not a plain prefix: clang's
+        // `-isystem-after <dir>` is another flag. GCC expands leading `=`
+        // and `$SYSROOT` directory values relative to its sysroot; joined
+        // values starting `=` or `$` stay unsupported until that resolution
+        // is modeled by `cc_flag_dir_values`.
+        matcher: Matcher::Regex(r"-isystem(?:[^-=$].*)?"),
         class: FlagClass::PreprocessorCaptured,
-        source: "PR #94",
+        source: "PR #94; joined form excluding -isystem-* and sysroot-indirect values.",
         dialect: None,
     },
     FlagSpec {
@@ -3164,15 +3171,17 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         dialect: None,
     },
     FlagSpec {
-        matcher: Matcher::Exact("-iquote"),
+        // Separated and joined (`-iquote<dir>`) forms, as for `-isystem`.
+        matcher: Matcher::Regex(r"-iquote(?:[^=$].*)?"),
         class: FlagClass::PreprocessorCaptured,
-        source: "PR #94",
+        source: "PR #94; joined form excluding sysroot-indirect values.",
         dialect: None,
     },
     FlagSpec {
-        matcher: Matcher::Exact("-idirafter"),
+        // Separated and joined (`-idirafter<dir>`) forms, as for `-isystem`.
+        matcher: Matcher::Regex(r"-idirafter(?:[^=$].*)?"),
         class: FlagClass::PreprocessorCaptured,
-        source: "PR #94",
+        source: "PR #94; joined form excluding sysroot-indirect values.",
         dialect: None,
     },
     FlagSpec {
@@ -6003,10 +6012,14 @@ fn cc_flag_dir_values<'a>(rest: &'a [String], flag: &'a str) -> Vec<&'a str> {
             if let Some(value) = args.next() {
                 values.push(value.as_str());
             }
-        } else if let Some(value) = suffix.strip_prefix('=')
-            && !value.is_empty()
-        {
-            values.push(value);
+        } else if let Some(value) = suffix.strip_prefix('=') {
+            if !value.is_empty() {
+                values.push(value);
+            }
+        } else if flag != "-isystem" || !suffix.starts_with('-') {
+            // `-isystem-after` is another flag, but `-iquote-headers`
+            // names the ordinary relative directory `-headers`.
+            values.push(suffix);
         }
     }
     values
