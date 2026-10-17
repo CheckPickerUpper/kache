@@ -752,7 +752,8 @@ impl RustcArgs {
     /// `--extern` them get unstable cache keys (the e422e55 relocate
     /// failure mode).
     pub fn is_user_facing_executable(&self) -> bool {
-        self.is_test || self.crate_types.iter().any(|t| t == "bin")
+        // An omitted crate type can produce rustc's default binary.
+        self.is_test || self.crate_types.is_empty() || self.crate_types.iter().any(|t| t == "bin")
     }
 
     /// The codegen backend dylib this compile loads, when `-Zcodegen-backend`
@@ -1886,7 +1887,7 @@ mod tests {
 
     #[test]
     fn test_is_user_facing_executable_excludes_proc_macro_and_dylib() {
-        // The narrower predicate: only `bin` + `--test` count.
+        // Default binaries, explicit `bin` and `--test` count.
         // proc-macro / dylib / cdylib are build-time artifacts that
         // should be cacheable, not skipped via the
         // cache_executables gate. This is the contract that lets
@@ -1924,6 +1925,14 @@ mod tests {
             parsed.is_user_facing_executable(),
             "--test must count as user-facing"
         );
+    }
+
+    #[test]
+    fn omitted_crate_type_is_a_user_facing_executable() {
+        let args = ["rustc", "--crate-name", "default_binary", "src/main.rs"].map(String::from);
+        let parsed = RustcArgs::parse(&args).unwrap();
+        assert!(parsed.crate_types.is_empty());
+        assert!(parsed.is_user_facing_executable());
     }
 
     #[test]
