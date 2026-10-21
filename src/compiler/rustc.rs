@@ -424,9 +424,9 @@ fn rustc_refuse_reasons(
             "rustc response file could not be safely expanded — not yet supported",
         ));
     }
-    if parsed.dep_info_output.is_some() {
+    if parsed.explicit_emit_output {
         reasons.push(RefuseReason::Unsupported(
-            "rustc explicit --emit=dep-info=<path> output — not cacheable",
+            "rustc explicit --emit output path — not cacheable",
         ));
     }
     // `--pretty`/`--unpretty` (and the `-Z unpretty=…` form) make rustc dump
@@ -965,21 +965,88 @@ mod tests {
     }
 
     #[test]
-    fn refuse_reasons_refuses_explicit_dep_info_output_path() {
-        let parsed = RustcCompiler::new()
+    fn refuse_reasons_refuses_explicit_emit_destinations_but_allows_defaults() {
+        let compiler = RustcCompiler::new();
+        for kind in [
+            "metadata", "link", "obj", "dep-info", "asm", "llvm-ir", "llvm-bc", "mir",
+        ] {
+            for separated in [false, true] {
+                let mut args = s(&["rustc", "src/lib.rs", "--crate-name", "foo"]);
+                let emit = format!("metadata,{kind}=custom/artifact");
+                if separated {
+                    args.extend(s(&["--emit", &emit]));
+                } else {
+                    args.push(format!("--emit={emit}"));
+                }
+                let parsed = compiler.parse(&args).unwrap();
+                let reasons = compiler.refuse_reasons(&parsed);
+                assert!(
+                    reasons.iter().any(|reason| matches!(reason,
+                        RefuseReason::Unsupported(detail) if detail.contains("explicit --emit")
+                    )),
+                    "{kind} {separated}: {reasons:?}"
+                );
+            }
+        }
+        let empty = compiler
             .parse(&s(&[
                 "rustc",
                 "src/lib.rs",
                 "--crate-name",
                 "foo",
-                "--emit=metadata,dep-info=custom/deps.mk",
+                "--emit=metadata=",
             ]))
             .unwrap();
-        let reasons = RustcCompiler::new().refuse_reasons(&parsed);
-        assert!(reasons.iter().any(|reason| matches!(
-            reason,
-            RefuseReason::Unsupported(detail) if detail.contains("explicit --emit=dep-info")
-        )));
+        assert!(
+            compiler
+                .refuse_reasons(&empty)
+                .iter()
+                .any(|reason| matches!(reason,
+                    RefuseReason::Unsupported(detail) if detail.contains("explicit --emit")
+                ))
+        );
+        let parsed = compiler
+            .parse(&s(&[
+                "rustc",
+                "src/lib.rs",
+                "--crate-name",
+                "foo",
+                "--emit=metadata,link",
+            ]))
+            .unwrap();
+        assert!(compiler.refuse_reasons(&parsed).is_empty());
+    }
+
+    #[test]
+    fn explicit_emit_destinations_follow_the_invocation_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = crate::invocation::InvocationEnv::from_parts(
+            std::iter::empty::<(&str, &str)>(),
+            Some(dir.path().to_path_buf()),
+            None,
+            dir.path().to_path_buf(),
+        );
+        let compiler = RustcCompiler::new_for(&env);
+        let response = dir.path().join("rustc.args");
+        for (emit, explicit) in [("metadata=custom.rmeta", true), ("metadata,link", false)] {
+            std::fs::write(
+                &response,
+                format!("lib.rs\n--crate-name=fixture\n--crate-type=rlib\n--emit={emit}\n"),
+            )
+            .unwrap();
+            let parsed = compiler.parse(&s(&["rustc", "@rustc.args"])).unwrap();
+            assert_eq!(parsed.explicit_emit_output, explicit);
+            assert_eq!(parsed.invocation_env().cwd(), Some(dir.path()));
+            assert_eq!(
+                compiler
+                    .refuse_reasons(&parsed)
+                    .iter()
+                    .any(|reason| matches!(reason,
+                        RefuseReason::Unsupported(detail) if detail.contains("explicit --emit")
+                    )),
+                explicit,
+            );
+        }
     }
 
     #[test]
