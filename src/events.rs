@@ -857,10 +857,303 @@ pub fn read_events_and<T>(
     Ok((events, extra))
 }
 
-/// Read events since a given timestamp.
+/// Read events since a given timestamp: the archived segments a rotation
+/// moved out of the log that reach `since` ([`archive_dropped_events`]),
+/// then the log itself.
+///
+/// The archive is read first. A rotation drops lines from the log before it
+/// archives them, so a rotation between the two reads can only leave its
+/// lines out of this answer, never count them twice.
 pub fn read_events_since(event_log_path: &Path, since: DateTime<Utc>) -> Result<Vec<BuildEvent>> {
+    let mut events = Vec::new();
+    for segment in archive_segments_since(event_log_path, since) {
+        let before = events.len();
+        let loaded = read_segment(&segment.path).and_then(|records| {
+            for event in records {
+                let event = event?;
+                if event.ts >= since {
+                    events.push(event);
+                }
+            }
+            Ok(())
+        });
+        if let Err(error) = loaded {
+            events.truncate(before);
+            tracing::debug!(
+                "skipping unreadable event archive {}: {error:#}",
+                segment.path.display()
+            );
+        }
+    }
     let all = read_events(event_log_path)?;
-    Ok(all.into_iter().filter(|e| e.ts >= since).collect())
+    events.extend(all.into_iter().filter(|e| e.ts >= since));
+    Ok(events)
+}
+
+/// [`compute_stats`] of [`read_events_since`], without reading again the
+/// archived segments that lie wholly inside the window each time: their
+/// stats are kept for recent windows (`kache monitor` asks every two
+/// seconds, and a busy day archives hundreds of MiB). Segments never change
+/// once written, so a total over the same segments is the same total; a new
+/// segment is added to it, and when one leaves the window the total is made
+/// again. The segment the window starts in, and the log, are read each time.
+pub fn event_stats_since(event_log_path: &Path, since: DateTime<Utc>) -> Result<EventStats> {
+    static MEMO: std::sync::Mutex<InsideStatsMemo> = std::sync::Mutex::new(Vec::new());
+    // A segment's times are whole seconds: one whose oldest event is in the
+    // window's first second may still hold an event before `since`.
+    let (inside, edge): (Vec<_>, Vec<_>) = archive_segments_since(event_log_path, since)
+        .into_iter()
+        .partition(|segment| segment.oldest > since.timestamp());
+    let mut stats = memoized_inside_stats(&MEMO, event_archive_dir(event_log_path), &inside);
+
+    for segment in edge {
+        match segment_stats_onto(stats.clone(), &segment.path, Some(since)) {
+            Ok(updated) => stats = updated,
+            Err(error) => tracing::debug!(
+                "skipping unreadable event archive {}: {error:#}",
+                segment.path.display()
+            ),
+        }
+    }
+    let live: Vec<_> = read_events(event_log_path)?
+        .into_iter()
+        .filter(|e| e.ts >= since)
+        .collect();
+    Ok(compute_stats_onto(stats, &live))
+}
+
+/// Recent archive/window totals. Keeping several windows prevents a monitor
+/// and a wider stats request from repeatedly evicting each other's totals.
+type InsideStatsMemo = Vec<(PathBuf, Vec<String>, EventStats)>;
+const EVENT_STATS_MEMO_WINDOWS: usize = 4;
+
+/// Do file I/O outside the shared memo lock. Concurrent stats requests may
+/// decode the same new segment, but cannot block each other's cached reads.
+fn memoized_inside_stats(
+    memo: &std::sync::Mutex<InsideStatsMemo>,
+    dir: PathBuf,
+    inside: &[ArchiveSegment],
+) -> EventStats {
+    let mut snapshot = memo.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let stats = inside_segments_stats(&mut snapshot, dir, inside);
+    let (dir, names, total) = snapshot.pop().expect("inside stats records its window");
+    remember_stats(
+        &mut memo.lock().unwrap_or_else(|p| p.into_inner()),
+        dir,
+        names,
+        total,
+    );
+    stats
+}
+
+/// Reuse the largest cached subset, then read only the missing segments.
+/// Failed reads never enter the cached name set, so the next call retries them.
+fn inside_segments_stats(
+    memo: &mut InsideStatsMemo,
+    dir: PathBuf,
+    inside: &[ArchiveSegment],
+) -> EventStats {
+    let wanted: std::collections::HashSet<&str> =
+        inside.iter().map(|segment| segment.name.as_str()).collect();
+    let (mut names, mut stats) = memo
+        .iter()
+        .filter(|(memo_dir, names, _)| {
+            memo_dir == &dir && names.iter().all(|name| wanted.contains(name.as_str()))
+        })
+        .max_by_key(|(_, names, _)| names.len())
+        .map(|(_, names, stats)| (names.clone(), stats.clone()))
+        .unwrap_or_default();
+    for segment in inside {
+        if names.contains(&segment.name) {
+            continue;
+        }
+        match segment_stats_onto(stats.clone(), &segment.path, None) {
+            Ok(updated) => {
+                stats = updated;
+                names.push(segment.name.clone());
+            }
+            Err(error) => tracing::debug!(
+                "skipping unreadable event archive {}: {error:#}",
+                segment.path.display()
+            ),
+        }
+    }
+    names.sort();
+    remember_stats(memo, dir, names, stats.clone());
+    stats
+}
+
+fn remember_stats(memo: &mut InsideStatsMemo, dir: PathBuf, names: Vec<String>, stats: EventStats) {
+    memo.retain(|(memo_dir, memo_names, _)| memo_dir != &dir || memo_names != &names);
+    memo.push((dir, names, stats));
+    if memo.len() > EVENT_STATS_MEMO_WINDOWS {
+        memo.remove(0);
+    }
+}
+
+fn segment_stats_onto(
+    mut stats: EventStats,
+    path: &Path,
+    since: Option<DateTime<Utc>>,
+) -> Result<EventStats> {
+    for event in read_segment(path)? {
+        let event = event?;
+        if since.is_none_or(|since| event.ts >= since) {
+            stats = compute_stats_onto(stats, std::slice::from_ref(&event));
+        }
+    }
+    Ok(stats)
+}
+
+/// How long archived events are kept: past the 24 h every windowed command
+/// uses by default, and a week for `--since 7d`.
+const EVENT_ARCHIVE_MAX_AGE_SECS: i64 = 8 * 24 * 3600;
+
+/// The most the archive holds, compressed. Build events compress about
+/// tenfold, so a busy machine's week fits; past this the oldest segments go.
+const EVENT_ARCHIVE_MAX_BYTES: u64 = 512 << 20;
+
+/// The directory beside the event log that holds the events rotations moved
+/// out of it: `events.jsonl` keeps them in `events.jsonl.archive/`.
+pub fn event_archive_dir(event_log_path: &Path) -> PathBuf {
+    let mut name = event_log_path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    name.push(".archive");
+    event_log_path.with_file_name(name)
+}
+
+/// One archived segment: `<newest>-<oldest>-<pid>-<nanos>.jsonl.zst`, the
+/// unix seconds of its newest and oldest events first.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ArchiveSegment {
+    newest: i64,
+    oldest: i64,
+    name: String,
+    path: PathBuf,
+}
+
+/// The newest and oldest event times a segment's name records.
+fn archive_segment_span(name: &str) -> Option<(i64, i64)> {
+    let mut fields = name.strip_suffix(".jsonl.zst")?.split('-');
+    let newest = fields.next()?.parse().ok()?;
+    let oldest = fields.next()?.parse().ok()?;
+    Some((newest, oldest))
+}
+
+/// The archive's segments, oldest first.
+fn archive_segments(event_log_path: &Path) -> Vec<ArchiveSegment> {
+    let Ok(entries) = fs::read_dir(event_archive_dir(event_log_path)) else {
+        return Vec::new();
+    };
+    let mut segments: Vec<ArchiveSegment> = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let name = entry.file_name().into_string().ok()?;
+            let (newest, oldest) = archive_segment_span(&name)?;
+            Some(ArchiveSegment {
+                newest,
+                oldest,
+                path: entry.path(),
+                name,
+            })
+        })
+        .collect();
+    segments.sort();
+    segments
+}
+
+/// The segments with an event at or after `since`, oldest first. The others
+/// are never opened.
+fn archive_segments_since(event_log_path: &Path, since: DateTime<Utc>) -> Vec<ArchiveSegment> {
+    let mut segments = archive_segments(event_log_path);
+    segments.retain(|segment| segment.newest >= since.timestamp());
+    segments
+}
+
+/// Decode one JSON record at a time. I/O and frame errors remain visible so
+/// callers can discard a partial segment and retry instead of caching zero.
+fn read_segment(path: &Path) -> Result<impl Iterator<Item = Result<BuildEvent>>> {
+    use std::io::BufRead;
+
+    let file = std::fs::File::open(path).context("opening event archive")?;
+    let decoder =
+        zstd::stream::read::Decoder::new(file).context("opening event archive decoder")?;
+    Ok(std::io::BufReader::new(decoder)
+        .split(b'\n')
+        .filter_map(|line| match line {
+            Ok(line) => serde_json::from_slice::<BuildEvent>(&line).ok().map(Ok),
+            Err(error) => Some(Err(error.into())),
+        }))
+}
+
+/// Keep the event lines a rotation dropped (kache `stats --since` used to see
+/// only what was left in the log: at 64 MiB, a busy machine's last few hours
+/// of a 24 h window). One zstd segment per rotation, written whole and
+/// renamed into place so readers never see half of one; then segments older
+/// than [`EVENT_ARCHIVE_MAX_AGE_SECS`] go, and the oldest beyond
+/// [`EVENT_ARCHIVE_MAX_BYTES`].
+fn archive_dropped_events(
+    event_log_path: &Path,
+    dropped: &[&str],
+    now: DateTime<Utc>,
+) -> Result<()> {
+    #[derive(Deserialize)]
+    struct TsOnly {
+        ts: DateTime<Utc>,
+    }
+    let times: Vec<i64> = dropped
+        .iter()
+        .filter_map(|line| serde_json::from_str::<TsOnly>(line.trim_end()).ok())
+        .map(|event| event.ts.timestamp())
+        .collect();
+    let (Some(newest), Some(oldest)) = (times.iter().max(), times.iter().min()) else {
+        return Ok(());
+    };
+    let dir = event_archive_dir(event_log_path);
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let compressed =
+        zstd::encode_all(dropped.concat().as_bytes(), 3).context("compressing rotated events")?;
+    let name = format!(
+        "{newest:011}-{oldest:011}-{}-{}.jsonl.zst",
+        std::process::id(),
+        now.timestamp_nanos_opt().unwrap_or_default()
+    );
+    crate::atomic::atomic_replace(&dir.join(name), &compressed)
+        .context("writing an event archive segment")?;
+    prune_event_archive(
+        event_log_path,
+        now,
+        EVENT_ARCHIVE_MAX_AGE_SECS,
+        EVENT_ARCHIVE_MAX_BYTES,
+    );
+    Ok(())
+}
+
+/// Remove expired segments, then the oldest ones until the archive fits its
+/// byte budget. A single oversized or expired segment is not an exception.
+fn prune_event_archive(
+    event_log_path: &Path,
+    now: DateTime<Utc>,
+    max_age_secs: i64,
+    max_bytes: u64,
+) {
+    let segments: Vec<(ArchiveSegment, u64)> = archive_segments(event_log_path)
+        .into_iter()
+        .filter_map(|segment| {
+            let len = fs::metadata(&segment.path).ok()?.len();
+            Some((segment, len))
+        })
+        .collect();
+    let cutoff = now.timestamp().saturating_sub(max_age_secs);
+    let mut total: u64 = segments.iter().map(|(_, len)| len).sum();
+    for (segment, len) in &segments {
+        if (segment.newest < cutoff || total > max_bytes) && fs::remove_file(&segment.path).is_ok()
+        {
+            total -= len;
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -1345,7 +1638,12 @@ pub fn rotate_events_if_needed(
         keep_lines,
         "event log",
         LogLock::Build,
-        fold,
+        |dropped| {
+            if let Err(e) = archive_dropped_events(event_log_path, dropped, Utc::now()) {
+                tracing::warn!("archiving rotated events: {e:#}");
+            }
+            fold(dropped)
+        },
     )
 }
 
@@ -1526,11 +1824,18 @@ pub fn clear_events(event_log_path: &Path) -> Result<()> {
     let lock = open_log_lock(event_log_path).context("opening event log lock")?;
     lock.lock().context("locking event log for clearing")?;
     let res = fs::write(event_log_path, "");
+    let archive = event_archive_dir(event_log_path);
+    let archive_res = match fs::remove_dir_all(&archive) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    };
     let _ = lock.unlock();
-    res.context("clearing event log")
+    res.context("clearing event log")?;
+    archive_res.with_context(|| format!("clearing {}", archive.display()))
 }
 
 /// Get event statistics.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EventStats {
     pub local_hits: usize,
     pub prefetch_hits: usize,
@@ -1604,50 +1909,11 @@ pub struct EventStats {
 }
 
 pub fn compute_stats(events: &[BuildEvent]) -> EventStats {
-    let mut stats = EventStats {
-        local_hits: 0,
-        prefetch_hits: 0,
-        remote_hits: 0,
-        dups: 0,
-        misses: 0,
-        errors: 0,
-        total_size: 0,
-        total_elapsed_ms: 0,
-        hit_elapsed_ms: 0,
-        miss_elapsed_ms: 0,
-        hit_compile_time_ms: 0,
-        miss_compile_time_ms: 0,
-        total_key_ms: 0,
-        total_lookup_ms: 0,
-        total_restore_ms: 0,
-        total_store_ms: 0,
-        total_startup_ms: 0,
-        total_dep_info_ms: 0,
-        total_dep_info_runs: 0,
-        total_prediction_mismatches: 0,
-        total_flight_wait_ms: 0,
-        total_permit_wait_ms: 0,
-        total_unattributed_ms: 0,
-        store_output_blobs: 0,
-        store_duplicate_blobs: 0,
-        store_new_blobs: 0,
-        reflinked_bytes: 0,
-        hardlinked_bytes: 0,
-        copied_bytes: 0,
-        store_reflinked_bytes: 0,
-        store_hardlinked_bytes: 0,
-        store_copied_bytes: 0,
-        store_copy_cross_device_bytes: 0,
-        store_copy_permission_bytes: 0,
-        store_copy_ineligible_bytes: 0,
-        store_copy_other_bytes: 0,
-        restore_copy_cross_device_bytes: 0,
-        restore_copy_permission_bytes: 0,
-        restore_copy_exclusive_bytes: 0,
-        restore_copy_other_bytes: 0,
-        store_failures: 0,
-    };
+    compute_stats_onto(EventStats::default(), events)
+}
 
+/// [`compute_stats`], adding `events` to `stats`.
+pub fn compute_stats_onto(mut stats: EventStats, events: &[BuildEvent]) -> EventStats {
     for event in events {
         match event.result {
             EventResult::LocalHit => {
@@ -2568,6 +2834,552 @@ mod tests {
         let events = read_events_since(&log_path, since).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].crate_name, "new");
+    }
+
+    /// A rotation moves its dropped lines to the archive, so a window that
+    /// reaches past the live log still sees them, once each, while the live
+    /// log keeps only its tail.
+    #[test]
+    fn read_events_since_reaches_past_rotations() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let start = Utc::now() - chrono::Duration::hours(10);
+        for i in 0..40 {
+            let mut event = test_event(&format!("c{i}"), EventResult::Miss, 1, 1, 1, "k");
+            event.ts = start + chrono::Duration::minutes(i * 15);
+            log_event(&log_path, &event).unwrap();
+            rotate_events_if_needed(&log_path, 2048, 3, dir.path()).unwrap();
+        }
+        let live = read_events(&log_path).unwrap();
+        assert!(
+            live.len() < 40,
+            "the log rotated: {} lines left",
+            live.len()
+        );
+
+        let all = read_events_since(&log_path, start).unwrap();
+        let names: Vec<_> = all.iter().map(|e| e.crate_name.clone()).collect();
+        let expected: Vec<_> = (0..40).map(|i| format!("c{i}")).collect();
+        assert_eq!(names, expected, "every event once, oldest first");
+
+        // A window that starts later leaves the older events out, archived
+        // or not.
+        let recent =
+            read_events_since(&log_path, start + chrono::Duration::minutes(15 * 30)).unwrap();
+        assert_eq!(recent.len(), 10);
+        assert_eq!(recent[0].crate_name, "c30");
+
+        clear_events(&log_path).unwrap();
+        assert!(read_events_since(&log_path, start).unwrap().is_empty());
+        assert!(!event_archive_dir(&log_path).exists());
+    }
+
+    /// Segments whose newest event is older than the window are never
+    /// opened, and one that cannot be decoded is skipped, not an error.
+    #[test]
+    fn archived_segments_outside_the_window_are_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let archive = event_archive_dir(&log_path);
+        assert_eq!(archive, dir.path().join("events.jsonl.archive"));
+        std::fs::create_dir_all(&archive).unwrap();
+        let now = Utc::now();
+        let old = (now - chrono::Duration::hours(30)).timestamp();
+        std::fs::write(
+            archive.join(format!("{old:011}-{old:011}-1-1.jsonl.zst")),
+            b"garbage",
+        )
+        .unwrap();
+        let recent = now.timestamp();
+        std::fs::write(
+            archive.join(format!("{recent:011}-{recent:011}-1-2.jsonl.zst")),
+            b"garbage",
+        )
+        .unwrap();
+
+        let mut event = test_event("kept", EventResult::Miss, 1, 1, 1, "k");
+        event.ts = now - chrono::Duration::hours(2);
+        let line = serde_json::to_string(&event).unwrap() + "\n";
+        archive_dropped_events(&log_path, &[line.as_str()], now).unwrap();
+
+        let events = read_events_since(&log_path, now - chrono::Duration::hours(24)).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].crate_name, "kept");
+        let names: Vec<_> = archive_segments_since(&log_path, now - chrono::Duration::hours(24))
+            .into_iter()
+            .map(|s| s.newest)
+            .collect();
+        assert_eq!(names.len(), 2, "the old segment is not listed: {names:?}");
+        assert!(names.iter().all(|&newest| newest > old));
+        assert!(
+            read_events_since(&log_path, now - chrono::Duration::hours(1))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn archive_segment_names_carry_their_span() {
+        assert_eq!(
+            archive_segment_span("00000000042-00000000040-7-9.jsonl.zst"),
+            Some((42, 40))
+        );
+        assert_eq!(
+            archive_segment_span("00000000042-00000000040-7-9.jsonl"),
+            None
+        );
+        assert_eq!(archive_segment_span("x-00000000040-7-9.jsonl.zst"), None);
+        assert_eq!(archive_segment_span("00000000042-y-7-9.jsonl.zst"), None);
+    }
+
+    /// Lines with no event time leave nothing to archive.
+    #[test]
+    fn archiving_lines_without_events_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        archive_dropped_events(&log_path, &["not json\n"], Utc::now()).unwrap();
+        assert!(!event_archive_dir(&log_path).exists());
+    }
+
+    /// A segment's name records its newest and oldest events.
+    #[test]
+    fn archived_segment_is_named_by_its_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let now = Utc::now();
+        let lines: Vec<String> = [5, 1, 3]
+            .iter()
+            .map(|h| {
+                let mut event = test_event("c", EventResult::Miss, 1, 1, 1, "k");
+                event.ts = now - chrono::Duration::hours(*h);
+                serde_json::to_string(&event).unwrap() + "\n"
+            })
+            .collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        archive_dropped_events(&log_path, &refs, now).unwrap();
+        let segments = archive_segments(&log_path);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(
+            segments[0].newest,
+            (now - chrono::Duration::hours(1)).timestamp()
+        );
+        assert_eq!(
+            segments[0].oldest,
+            (now - chrono::Duration::hours(5)).timestamp()
+        );
+    }
+
+    /// Pruning drops expired segments, then enough old segments to fit.
+    #[test]
+    fn event_archive_prunes_by_age_then_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let archive = event_archive_dir(&log_path);
+        std::fs::create_dir_all(&archive).unwrap();
+        let now = Utc::now();
+        let t = now.timestamp();
+        let write = |newest: i64, len: usize| {
+            let name = format!("{newest:011}-{newest:011}-1-{len}.jsonl.zst");
+            std::fs::write(archive.join(&name), vec![0u8; len]).unwrap();
+            name
+        };
+        let ancient = write(t - 100, 10);
+        let older = write(t - 50, 11);
+        let old = write(t - 40, 12);
+        let new = write(t - 1, 13);
+        let present = |name: &str| archive.join(name).exists();
+
+        prune_event_archive(&log_path, now, 60, 1 << 20);
+        assert!(!present(&ancient), "older than the age");
+        assert!(present(&older) && present(&old) && present(&new));
+
+        prune_event_archive(&log_path, now, 60, 25);
+        assert!(!present(&older), "the oldest goes first");
+        assert!(present(&old) && present(&new), "25 bytes left fit");
+
+        prune_event_archive(&log_path, now, 0, 0);
+        assert!(!present(&old));
+        assert!(!present(&new), "a zero byte budget keeps no segments");
+    }
+
+    /// Past the size, the oldest segments go one by one until the rest fit.
+    #[test]
+    fn event_archive_prunes_the_oldest_until_the_rest_fit() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let archive = event_archive_dir(&log_path);
+        std::fs::create_dir_all(&archive).unwrap();
+        let now = Utc::now();
+        let t = now.timestamp();
+        let paths: Vec<_> = [(4, 10), (3, 11), (2, 12), (1, 13)]
+            .iter()
+            .map(|&(age, len): &(i64, usize)| {
+                let newest = t - age;
+                let path = archive.join(format!("{newest:011}-{newest:011}-1-{len}.jsonl.zst"));
+                std::fs::write(&path, vec![0u8; len]).unwrap();
+                path
+            })
+            .collect();
+        prune_event_archive(&log_path, now, 3600, 25);
+        let kept: Vec<bool> = paths.iter().map(|path| path.exists()).collect();
+        assert_eq!(kept, [false, false, true, true]);
+    }
+
+    /// The archive keeps eight days of segments, a week for `--since 7d`
+    /// and a day to spare, and drops what is older.
+    #[test]
+    fn event_archive_keeps_eight_days() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let archive = event_archive_dir(&log_path);
+        std::fs::create_dir_all(&archive).unwrap();
+        let now = Utc::now();
+        let write = |age: chrono::Duration| {
+            let newest = (now - age).timestamp();
+            let name = format!("{newest:011}-{newest:011}-1-1.jsonl.zst");
+            std::fs::write(archive.join(&name), b"x").unwrap();
+            archive.join(name)
+        };
+        let nine_days = write(chrono::Duration::days(9));
+        let week = write(chrono::Duration::days(7));
+        let eight_days = write(chrono::Duration::days(8));
+        let hour = write(chrono::Duration::hours(1));
+        prune_event_archive(
+            &log_path,
+            now,
+            EVENT_ARCHIVE_MAX_AGE_SECS,
+            EVENT_ARCHIVE_MAX_BYTES,
+        );
+        assert!(!nine_days.exists());
+        assert!(eight_days.exists() && week.exists() && hour.exists());
+    }
+
+    /// The windowed stats count every event in the window once, archived or
+    /// not, whatever segments an earlier call kept: the same as
+    /// compute_stats over read_events_since.
+    #[test]
+    fn event_stats_since_matches_the_events_across_calls() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let start = Utc::now() - chrono::Duration::hours(20);
+        let log = |from: i64, to: i64| {
+            for i in from..to {
+                let mut event =
+                    test_event(&format!("c{i}"), EventResult::Miss, 1, 2, i as u64, "k");
+                event.ts = start + chrono::Duration::minutes(i * 10);
+                log_event(&log_path, &event).unwrap();
+                rotate_events_if_needed(&log_path, 2048, 2, dir.path()).unwrap();
+            }
+        };
+        let check = |since: DateTime<Utc>| {
+            let stats = event_stats_since(&log_path, since).unwrap();
+            let expected = compute_stats(&read_events_since(&log_path, since).unwrap());
+            assert_eq!(stats, expected, "since {since}");
+            stats
+        };
+        log(0, 60);
+        assert!(archive_segments(&log_path).len() > 3);
+        assert_eq!(check(start).misses, 60);
+        // New segments since the last call are added to what it kept.
+        log(60, 90);
+        assert_eq!(check(start).misses, 90);
+        // A window that drops segments makes the total again.
+        let later = start + chrono::Duration::minutes(10 * 45);
+        assert_eq!(check(later).misses, 45);
+        assert_eq!(check(start).misses, 90);
+        // Another log's archive is not this one's.
+        let other = tempfile::tempdir().unwrap();
+        let other_log = other.path().join("events.jsonl");
+        assert_eq!(event_stats_since(&other_log, start).unwrap().misses, 0);
+        assert_eq!(check(start).misses, 90);
+    }
+
+    /// A segment the window starts in counts only its events inside the
+    /// window, also when its oldest event is in the window's first second.
+    #[test]
+    fn event_stats_since_counts_only_the_window_of_a_segment_it_starts_in() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let now = Utc::now();
+        let since =
+            DateTime::from_timestamp((now - chrono::Duration::hours(2)).timestamp(), 500_000_000)
+                .unwrap();
+        let line = |result: EventResult, ts: DateTime<Utc>| {
+            let mut event = test_event("c", result, 1, 1, 1, "k");
+            event.ts = ts;
+            serde_json::to_string(&event).unwrap() + "\n"
+        };
+        // Hits before the window, misses inside it.
+        for before in [
+            since - chrono::Duration::hours(1),
+            since - chrono::Duration::milliseconds(200),
+        ] {
+            let lines = [
+                line(EventResult::LocalHit, before),
+                line(EventResult::Miss, since + chrono::Duration::minutes(30)),
+            ];
+            let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+            archive_dropped_events(&log_path, &refs, now).unwrap();
+        }
+        assert_eq!(archive_segments(&log_path).len(), 2);
+        let stats = event_stats_since(&log_path, since).unwrap();
+        assert_eq!((stats.misses, stats.local_hits), (2, 0));
+    }
+
+    /// A segment wholly inside the window is read once: later calls over the
+    /// same archive take its stats from the memo, and read only new segments.
+    #[test]
+    fn inside_segments_are_read_once_per_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let archive = event_archive_dir(&log_path);
+        let now = Utc::now();
+        let archive_misses = |count: i64| {
+            let lines: Vec<String> = (0..count)
+                .map(|i| {
+                    let mut event = test_event("c", EventResult::Miss, 1, 1, 1, "k");
+                    event.ts = now - chrono::Duration::minutes(10 * count + i);
+                    serde_json::to_string(&event).unwrap() + "\n"
+                })
+                .collect();
+            let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+            archive_dropped_events(&log_path, &refs, now).unwrap();
+        };
+        let mut memo = Vec::new();
+        archive_misses(1);
+        let first = archive_segments(&log_path);
+        assert_eq!(
+            inside_segments_stats(&mut memo, archive.clone(), &first).misses,
+            1
+        );
+
+        // The first segment is not read again: its stats come from the memo.
+        std::fs::write(&first[0].path, b"garbage").unwrap();
+        archive_misses(2);
+        let both = archive_segments(&log_path);
+        assert_eq!(both.len(), 2);
+        assert_eq!(
+            inside_segments_stats(&mut memo, archive.clone(), &both).misses,
+            3
+        );
+
+        // Another archive's memo is not used.
+        let mut other_memo = memo.clone();
+        let other = dir.path().join("other.archive");
+        assert_eq!(
+            inside_segments_stats(&mut other_memo, other, &both).misses,
+            2
+        );
+
+        // A window that drops a segment makes the total again.
+        let newer: Vec<_> = both
+            .into_iter()
+            .filter(|s| s.name != first[0].name)
+            .collect();
+        assert_eq!(inside_segments_stats(&mut memo, archive, &newer).misses, 2);
+    }
+
+    #[test]
+    fn alternating_stats_windows_reuse_their_own_complete_totals() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events.jsonl");
+        let now = Utc::now();
+        for age in [2, 1] {
+            let mut event = test_event("archived", EventResult::Miss, 1, 2, 3, "k");
+            event.ts = now - chrono::Duration::hours(age);
+            let line = serde_json::to_string(&event).unwrap() + "\n";
+            archive_dropped_events(&log, &[&line], now).unwrap();
+        }
+        let segments = archive_segments(&log);
+        assert_eq!(segments.len(), 2);
+        let archive = event_archive_dir(&log);
+        let mut memo = Vec::new();
+        assert_eq!(
+            inside_segments_stats(&mut memo, archive.clone(), &segments[1..]).misses,
+            1
+        );
+        assert_eq!(
+            inside_segments_stats(&mut memo, archive.clone(), &segments).misses,
+            2
+        );
+        // Reading either segment again would lose its events. Both cached
+        // windows must survive alternating monitor and wider stats requests.
+        for segment in &segments {
+            fs::write(&segment.path, b"not a zstd frame").unwrap();
+        }
+        for _ in 0..3 {
+            assert_eq!(
+                inside_segments_stats(&mut memo, archive.clone(), &segments[1..]).misses,
+                1
+            );
+            assert_eq!(
+                inside_segments_stats(&mut memo, archive.clone(), &segments).misses,
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn a_shared_stats_memo_reuses_a_completed_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events.jsonl");
+        let now = Utc::now();
+        let mut event = test_event("memo", EventResult::Miss, 1, 2, 3, "k");
+        event.ts = now - chrono::Duration::hours(1);
+        let line = serde_json::to_string(&event).unwrap() + "\n";
+        archive_dropped_events(&log, &[&line], now).unwrap();
+        let segments = archive_segments(&log);
+        let memo = std::sync::Mutex::new(Vec::new());
+        assert_eq!(
+            memoized_inside_stats(&memo, event_archive_dir(&log), &segments).misses,
+            1
+        );
+        fs::write(&segments[0].path, b"not a frame").unwrap();
+        assert_eq!(
+            memoized_inside_stats(&memo, event_archive_dir(&log), &segments).misses,
+            1
+        );
+    }
+
+    #[test]
+    fn a_broken_edge_segment_cannot_add_its_decoded_prefix_to_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events.jsonl");
+        let now = Utc::now();
+        let since = now - chrono::Duration::hours(1);
+        let mut event = test_event("edge", EventResult::Miss, 1, 2, 3, "k");
+        event.ts = since + chrono::Duration::minutes(10);
+        event.crate_name = "long_edge_".repeat(2048);
+        let line = serde_json::to_string(&event).unwrap() + "\n";
+        let mut frame = zstd::encode_all(line.repeat(4).as_bytes(), 3).unwrap();
+        let mut tail = zstd::encode_all(line.as_bytes(), 3).unwrap();
+        tail.truncate(tail.len() - 1);
+        frame.extend(tail);
+        let archive = event_archive_dir(&log);
+        fs::create_dir_all(&archive).unwrap();
+        let path = archive.join(format!(
+            "{:011}-{:011}-1-1.jsonl.zst",
+            event.ts.timestamp(),
+            since.timestamp()
+        ));
+        fs::write(&path, frame).unwrap();
+        // Prove that the decoder delivered records before its frame error.
+        let decoded = read_segment(&path).unwrap().take(8).collect::<Vec<_>>();
+        assert!(decoded.iter().any(Result::is_ok));
+        assert!(decoded.iter().any(Result::is_err));
+        let live = test_event("live", EventResult::LocalHit, 1, 2, 3, "k");
+        log_event(&log, &live).unwrap();
+        let stats = event_stats_since(&log, since).unwrap();
+        assert_eq!(stats.local_hits, 1);
+        assert_eq!(stats.misses, 0);
+        let segments = archive_segments_since(&log, event.ts);
+        assert_eq!(segments.len(), 1, "the exact newest timestamp is included");
+        assert!(archive_segments_since(&log, event.ts + chrono::Duration::seconds(1)).is_empty());
+    }
+
+    #[test]
+    fn a_failed_segment_is_retried_instead_of_becoming_a_cached_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events.jsonl");
+        let now = Utc::now();
+        let mut event = test_event("retry", EventResult::Miss, 1, 2, 3, "k");
+        event.ts = now - chrono::Duration::hours(1);
+        let line = serde_json::to_string(&event).unwrap() + "\n";
+        archive_dropped_events(&log, &[&line], now).unwrap();
+        let segments = archive_segments(&log);
+        let path = &segments[0].path;
+        let complete = fs::read(path).unwrap();
+        fs::write(path, b"temporarily unreadable frame").unwrap();
+        let mut memo = Vec::new();
+        let archive = event_archive_dir(&log);
+        assert_eq!(
+            inside_segments_stats(&mut memo, archive.clone(), &segments).misses,
+            0
+        );
+        fs::write(path, complete).unwrap();
+        assert_eq!(
+            inside_segments_stats(&mut memo, archive, &segments).misses,
+            1
+        );
+    }
+
+    #[test]
+    fn streaming_a_broken_segment_discards_its_already_decoded_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events.jsonl");
+        let now = Utc::now();
+        let mut archived = test_event("large_record", EventResult::Miss, 1, 2, 3, "k");
+        archived.crate_name = "large_record_".repeat(2048);
+        archived.ts = now - chrono::Duration::hours(1);
+        let line = serde_json::to_string(&archived).unwrap() + "\n";
+        let mut frame = zstd::encode_all(line.repeat(4).as_bytes(), 3).unwrap();
+        let mut broken = zstd::encode_all(line.as_bytes(), 3).unwrap();
+        broken.truncate(broken.len() - 1);
+        frame.extend(broken);
+        let archive = event_archive_dir(&log);
+        fs::create_dir_all(&archive).unwrap();
+        let second = archived.ts.timestamp();
+        fs::write(
+            archive.join(format!("{second:011}-{second:011}-1-1.jsonl.zst")),
+            frame,
+        )
+        .unwrap();
+        let mut live = test_event("live", EventResult::LocalHit, 1, 2, 3, "k");
+        live.ts = now;
+        log_event(&log, &live).unwrap();
+        let segment = archive_segments(&log);
+        let decoded = read_segment(&segment[0].path)
+            .unwrap()
+            .take(8)
+            .collect::<Vec<_>>();
+        assert!(decoded.iter().any(Result::is_ok));
+        assert!(decoded.iter().any(Result::is_err));
+        let events = read_events_since(&log, now - chrono::Duration::days(1)).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].crate_name, "live");
+    }
+
+    #[test]
+    fn the_stats_memo_stays_bounded_across_many_archives() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let mut memo = Vec::new();
+        for i in 0..12 {
+            let log = dir.path().join(format!("events-{i}.jsonl"));
+            let mut event = test_event("bounded", EventResult::Miss, 1, 2, 3, "k");
+            event.ts = now - chrono::Duration::hours(1);
+            let line = serde_json::to_string(&event).unwrap() + "\n";
+            archive_dropped_events(&log, &[&line], now).unwrap();
+            assert_eq!(
+                inside_segments_stats(&mut memo, event_archive_dir(&log), &archive_segments(&log))
+                    .misses,
+                1
+            );
+            assert!(memo.len() <= 4);
+        }
+        assert_eq!(memo.len(), 4);
+    }
+
+    #[test]
+    fn a_single_archive_segment_still_obeys_the_retention_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events.jsonl");
+        let archive = event_archive_dir(&log);
+        fs::create_dir_all(&archive).unwrap();
+        let now = Utc::now();
+        let old = now.timestamp() - 11;
+        let path = archive.join(format!("{old:011}-{old:011}-1-1.jsonl.zst"));
+        fs::write(&path, b"1234").unwrap();
+        prune_event_archive(&log, now, 10, 100);
+        assert!(!path.exists());
+        let current = now.timestamp();
+        let path = archive.join(format!("{current:011}-{current:011}-1-1.jsonl.zst"));
+        fs::write(&path, b"1234").unwrap();
+        prune_event_archive(&log, now, 10, 3);
+        assert!(!path.exists());
+        assert_eq!(EVENT_ARCHIVE_MAX_BYTES, 536_870_912);
     }
 
     #[test]
