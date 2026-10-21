@@ -1743,6 +1743,16 @@ fn upload_retry_and_idle_timeout_truth_tables() {
     assert_eq!(daemon_idle_timeout(60), Some(Duration::from_secs(60)));
 }
 
+#[test]
+fn foreground_startup_rejects_a_file_in_place_of_the_runtime_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.runtime_dir = dir.path().join("runtime");
+    fs::write(&config.runtime_dir, b"not a directory").unwrap();
+    let provenance = crate::config::config_file_provenance_at(dir.path().join("config.toml"));
+    assert!(run_server(&config, &provenance, None).is_err());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn server_main_binds_socket_and_handles_shutdown() {
     let dir = tempfile::tempdir().unwrap();
@@ -1762,8 +1772,16 @@ async fn server_main_binds_socket_and_handles_shutdown() {
     let coord = DaemonCoordFile::for_socket(&socket_path);
     let server_config = config.clone();
     let provenance = crate::config::config_file_provenance_at(dir.path().join("config.toml"));
-    let server =
-        tokio::spawn(async move { server_main(&server_config, &provenance, coord, None).await });
+    let server = tokio::spawn(async move {
+        server_main(
+            &server_config,
+            &provenance,
+            coord,
+            None,
+            PathBuf::from("Cargo.lock"),
+        )
+        .await
+    });
 
     let ready_socket = socket_path.clone();
     let ready = tokio::task::spawn_blocking(move || {
@@ -3569,6 +3587,28 @@ fn gc_hints_coalesce_while_a_sweep_is_pending() {
         daemon.claim_gc_hint(),
         "a finished sweep releases the claim"
     );
+}
+
+#[test]
+fn delegated_gc_uses_the_invocation_budget_without_changing_daemon_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut startup = test_config(dir.path());
+    startup.auto_gc = false;
+    startup.max_size = 10_000;
+    let mut invocation = startup.clone();
+    invocation.auto_gc = true;
+    invocation.max_size = 1_000;
+    let store = Store::open(&invocation).unwrap();
+    put_upload_evict_entry(&store, dir.path(), "evictable", 1_200, false);
+
+    let daemon = Daemon::new(startup);
+    daemon
+        .sweep_invocation_under_size_pressure(&invocation)
+        .unwrap();
+    assert!(!store.contains("evictable"));
+    assert!(store.physical_size().unwrap() <= 1_000);
+    assert!(!daemon.config.auto_gc);
+    assert_eq!(daemon.config.max_size, 10_000);
 }
 
 #[test]
@@ -10573,7 +10613,7 @@ async fn test_prefetch_disabled_remote_releases_warming_barrier() {
     let daemon = Arc::new(Daemon::new(config));
 
     assert!(
-        start_manifest_warming(&daemon).is_none(),
+        start_manifest_warming(&daemon, PathBuf::from("Cargo.lock")).is_none(),
         "prefetch-disabled startup must not spawn a warming task"
     );
     let start = std::time::Instant::now();
@@ -10582,6 +10622,31 @@ async fn test_prefetch_disabled_remote_releases_warming_barrier() {
         start.elapsed() < Duration::from_millis(500),
         "prefetch-disabled exact checks must not pay the warming grace"
     );
+}
+
+#[tokio::test]
+async fn enabled_manifest_warming_spawns_and_releases_its_barrier() {
+    let dir = tempfile::tempdir().unwrap();
+    let remote = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.prefetch_enabled = true;
+    config.remote = Some(crate::config::RemoteConfig {
+        prefix: "artifacts".into(),
+        backend: crate::config::RemoteBackendConfig::Filesystem(
+            crate::config::FilesystemRemoteConfig {
+                root: remote.path().to_owned(),
+                atomic_write_dir: remote.path().join("staging"),
+            },
+        ),
+    });
+    let daemon = Arc::new(Daemon::new(config));
+    let warming = start_manifest_warming(&daemon, dir.path().join("absent/Cargo.lock"))
+        .expect("enabled prefetch must start its warming task");
+    tokio::time::timeout(Duration::from_secs(5), warming)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(daemon.wait_for_warming(Duration::from_millis(100)).await);
 }
 
 #[tokio::test]
