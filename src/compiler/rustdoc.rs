@@ -358,8 +358,11 @@ struct SourceRecord {
 /// Crate inputs in a stable order.
 ///
 /// `mod name;` and `#[path = "rel"] mod name;` are followed even when a `cfg`
-/// would drop them. A `mod` inside an inline `mod name { ... }` is resolved
-/// under that name. A missing file is skipped. A file that exists but cannot
+/// would drop them. An implicit `foo.rs` module resolves children under
+/// `foo/`; `mod.rs`, crate roots and explicit paths keep their directory.
+/// A `mod` inside an inline `mod name { ... }` is resolved under that name.
+/// A file loaded in both implicit and explicit roles is scanned in both
+/// contexts but enters the key once. A missing file is skipped. A file that exists but cannot
 /// be read is an error, and the invocation is not cached. `include!`,
 /// `include_str!`, and `include_bytes!` count only with a string literal;
 /// anything else is an error. Dep-info is not read here.
@@ -371,7 +374,14 @@ fn source_records(sources: &[PathBuf], env: &InvocationEnv) -> Result<Vec<Source
     let mut seen = BTreeSet::new();
     let mut files = Vec::new();
     for source in sources {
-        collect_source_for(source, &crate_dir, true, &mut seen, &mut files, env)?;
+        collect_source_for(
+            source,
+            &crate_dir,
+            true,
+            false,
+            (&mut seen, &mut files),
+            env,
+        )?;
     }
     files.sort_by(|left, right| left.relative.cmp(&right.relative));
     let mut records = Vec::with_capacity(files.len() + 1);
@@ -388,15 +398,16 @@ fn collect_source(
     path: &Path,
     crate_dir: &Path,
     required: bool,
-    seen: &mut BTreeSet<PathBuf>,
+    module_file: bool,
+    seen: &mut BTreeSet<(PathBuf, bool)>,
     out: &mut Vec<SourceRecord>,
 ) -> Result<()> {
     collect_source_for(
         path,
         crate_dir,
         required,
-        seen,
-        out,
+        module_file,
+        (seen, out),
         &InvocationEnv::capture(),
     )
 }
@@ -405,12 +416,15 @@ fn collect_source_for(
     path: &Path,
     crate_dir: &Path,
     required: bool,
-    seen: &mut BTreeSet<PathBuf>,
-    out: &mut Vec<SourceRecord>,
+    module_file: bool,
+    (seen, out): (&mut BTreeSet<(PathBuf, bool)>, &mut Vec<SourceRecord>),
     env: &InvocationEnv,
 ) -> Result<()> {
     let absolute = lexical_absolute_for(path, env)?;
-    if !seen.insert(absolute.clone()) {
+    // The same file can be both `mod foo;` and `#[path = "foo.rs"] mod alias;`.
+    // Their children have different roots, so cycle detection needs the role.
+    let first_visit = !seen.contains(&(absolute.clone(), !module_file));
+    if !seen.insert((absolute.clone(), module_file)) {
         return Ok(());
     }
     match std::fs::metadata(&absolute) {
@@ -433,20 +447,30 @@ fn collect_source_for(
     }
     let bytes = std::fs::read(&absolute)
         .with_context(|| format!("reading {} for the rustdoc cache key", absolute.display()))?;
-    let relative = relative_label(crate_dir, &absolute);
-    out.push(SourceRecord {
-        relative,
-        paths: vec![absolute.to_string_lossy().into_owned()],
-    });
+    if first_visit {
+        let relative = relative_label(crate_dir, &absolute);
+        out.push(SourceRecord {
+            relative,
+            paths: vec![absolute.to_string_lossy().into_owned()],
+        });
+    }
     let parent = absolute.parent().unwrap_or(Path::new(""));
+    // An implicit foo.rs module owns foo/ for children; explicit paths keep the parent.
+    let module_dir = if module_file && absolute.file_name() != Some(std::ffi::OsStr::new("mod.rs"))
+    {
+        absolute.with_extension("")
+    } else {
+        parent.to_path_buf()
+    };
     for found in scan_rust(&bytes)? {
         match found {
             Found::Include(rel) => {
-                collect_source_for(&parent.join(rel), crate_dir, false, seen, out, env)?;
+                collect_source_for(&parent.join(rel), crate_dir, false, false, (seen, out), env)?;
             }
             Found::Module { path, name } => {
-                if let Some(next) = resolve_module_for(parent, path.as_deref(), &name, env)? {
-                    collect_source_for(&next, crate_dir, false, seen, out, env)?;
+                let dir = if path.is_some() { parent } else { &module_dir };
+                if let Some(next) = resolve_module_for(dir, path.as_deref(), &name, env)? {
+                    collect_source_for(&next, crate_dir, false, path.is_none(), (seen, out), env)?;
                 }
             }
         }
@@ -2439,6 +2463,176 @@ mod tests {
     }
 
     #[test]
+    fn explicit_path_modules_resolve_children_beside_the_module_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("renamed")).unwrap();
+        std::fs::write(root.join("lib.rs"), "#[path = \"renamed.rs\"] mod foo;\n").unwrap();
+        std::fs::write(root.join("renamed.rs"), "mod child;\n").unwrap();
+        std::fs::write(root.join("child.rs"), "pub fn thing() {}\n").unwrap();
+        std::fs::write(root.join("renamed/child.rs"), "pub fn decoy() {}\n").unwrap();
+        let records = source_records(&[root.join("lib.rs")], &InvocationEnv::capture()).unwrap();
+        let names: Vec<_> = records
+            .iter()
+            .map(|record| record.relative.as_str())
+            .collect();
+        assert_eq!(names, [".", "child.rs", "lib.rs", "renamed.rs"]);
+    }
+
+    #[test]
+    fn mod_rs_children_remain_in_the_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("foo")).unwrap();
+        std::fs::write(root.join("lib.rs"), "mod foo;\n").unwrap();
+        std::fs::write(root.join("foo/mod.rs"), "mod child;\n").unwrap();
+        std::fs::write(root.join("foo/child.rs"), "pub fn thing() {}\n").unwrap();
+        let records = source_records(&[root.join("lib.rs")], &InvocationEnv::capture()).unwrap();
+        let names: Vec<_> = records
+            .iter()
+            .map(|record| record.relative.as_str())
+            .collect();
+        assert_eq!(names, [".", "foo/child.rs", "foo/mod.rs", "lib.rs"]);
+    }
+
+    #[test]
+    fn non_mod_rs_modules_resolve_children_below_their_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("foo/child")).unwrap();
+        std::fs::write(root.join("entry.rs"), "mod foo;\n").unwrap();
+        std::fs::write(
+            root.join("foo.rs"),
+            "mod child;\ninclude_str!(\"note.txt\");\n#[path = \"renamed.rs\"] mod alias;\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("foo/child.rs"), "mod grand;\n").unwrap();
+        std::fs::write(root.join("foo/child/grand.rs"), "pub fn grand() {}\n").unwrap();
+        for file in ["child.rs", "note.txt", "renamed.rs"] {
+            std::fs::write(root.join(file), "pub fn decoy() {}\n").unwrap();
+        }
+        let records = source_records(&[root.join("entry.rs")], &InvocationEnv::capture()).unwrap();
+        let names: Vec<_> = records
+            .iter()
+            .map(|record| record.relative.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ".",
+                "entry.rs",
+                "foo.rs",
+                "foo/child.rs",
+                "foo/child/grand.rs",
+                "note.txt",
+                "renamed.rs"
+            ]
+        );
+    }
+
+    #[test]
+    fn one_source_in_implicit_and_explicit_modules_keys_both_child_roots() {
+        for root_source in [
+            "mod foo; #[path = \"foo.rs\"] mod alias;\n",
+            "#[path = \"foo.rs\"] mod alias; mod foo;\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            std::fs::create_dir(root.join("foo")).unwrap();
+            let lib = root.join("lib.rs");
+            std::fs::write(&lib, root_source).unwrap();
+            std::fs::write(root.join("foo.rs"), "mod child;\n").unwrap();
+            for child in ["child.rs", "foo/child.rs"] {
+                std::fs::write(root.join(child), "pub fn thing() {}\n").unwrap();
+            }
+            let env = InvocationEnv::from_parts(
+                std::iter::empty::<(&str, &str)>(),
+                Some(root.to_path_buf()),
+                None,
+                root.to_path_buf(),
+            );
+            let records = source_records(&[PathBuf::from("lib.rs")], &env).unwrap();
+            let names: Vec<_> = records
+                .iter()
+                .map(|record| record.relative.as_str())
+                .collect();
+            assert_eq!(names, [".", "child.rs", "foo.rs", "foo/child.rs", "lib.rs"]);
+            let parsed = parse_args_for(
+                &argv(&[
+                    "rustdoc",
+                    "--merge=none",
+                    "--crate-name=roles",
+                    "lib.rs",
+                    "-o",
+                    "out",
+                    "--parts-out-dir",
+                    "parts",
+                ]),
+                &env,
+            );
+            let original = cache_key_with(&parsed, "v", None).unwrap();
+            for child in ["child.rs", "foo/child.rs"] {
+                std::fs::write(root.join(child), "pub fn changed() {}\n").unwrap();
+                assert_ne!(
+                    original,
+                    cache_key_with(&parsed, "v", None).unwrap(),
+                    "{root_source:?} omitted {child}",
+                );
+                std::fs::write(root.join(child), "pub fn thing() {}\n").unwrap();
+                assert_eq!(original, cache_key_with(&parsed, "v", None).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn role_aware_visits_terminate_alias_cycles_without_duplicate_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("foo")).unwrap();
+        std::fs::write(root.join("lib.rs"), "mod foo;\n").unwrap();
+        std::fs::write(
+            root.join("foo.rs"),
+            "#[path = \"foo.rs\"] mod cycle; mod child;\n",
+        )
+        .unwrap();
+        for child in ["child.rs", "foo/child.rs"] {
+            std::fs::write(root.join(child), "pub fn thing() {}\n").unwrap();
+        }
+        let records = source_records(&[root.join("lib.rs")], &InvocationEnv::capture()).unwrap();
+        let names: Vec<_> = records
+            .iter()
+            .map(|record| record.relative.as_str())
+            .collect();
+        assert_eq!(names, [".", "child.rs", "foo.rs", "foo/child.rs", "lib.rs"]);
+    }
+
+    #[test]
+    fn implicit_modules_keep_inline_children_and_mod_rs_fallbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("foo/inline/leaf")).unwrap();
+        std::fs::write(root.join("lib.rs"), "mod foo;\n").unwrap();
+        std::fs::write(root.join("foo.rs"), "mod inline { mod leaf; }\n").unwrap();
+        std::fs::write(root.join("foo/inline/leaf/mod.rs"), "mod child;\n").unwrap();
+        std::fs::write(root.join("foo/inline/leaf/child.rs"), "pub fn thing() {}\n").unwrap();
+        let records = source_records(&[root.join("lib.rs")], &InvocationEnv::capture()).unwrap();
+        let names: Vec<_> = records
+            .iter()
+            .map(|record| record.relative.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ".",
+                "foo.rs",
+                "foo/inline/leaf/child.rs",
+                "foo/inline/leaf/mod.rs",
+                "lib.rs",
+            ],
+        );
+    }
+
+    #[test]
     fn modules_and_includes_enter_the_key_and_dep_info_does_not() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");
@@ -3640,7 +3834,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut seen = BTreeSet::new();
         let mut out = Vec::new();
-        collect_source(dir.path(), dir.path(), true, &mut seen, &mut out).unwrap();
+        collect_source(dir.path(), dir.path(), true, false, &mut seen, &mut out).unwrap();
         assert!(out.is_empty());
     }
 
@@ -3652,6 +3846,7 @@ mod tests {
         collect_source(
             &dir.path().join("missing.rs"),
             dir.path(),
+            false,
             false,
             &mut seen,
             &mut out,
@@ -3675,7 +3870,7 @@ mod tests {
         std::os::unix::fs::symlink(&link, &link).unwrap();
         let mut seen = BTreeSet::new();
         let mut out = Vec::new();
-        assert!(collect_source(&link, dir.path(), false, &mut seen, &mut out).is_err());
+        assert!(collect_source(&link, dir.path(), false, false, &mut seen, &mut out).is_err());
         assert!(resolve_module(dir.path(), None, "loop").is_err());
     }
 
