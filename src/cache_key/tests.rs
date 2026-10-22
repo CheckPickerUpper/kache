@@ -12222,6 +12222,274 @@ fn runtime_env_use_scan_rejects_content_changed_after_hashing() {
 }
 
 #[test]
+fn env_use_scan_retains_non_utf8_runtime_value_veto() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = dir.path().join("blob.bin");
+    std::fs::write(&blob, b"\xff pub const OUT: &str = env!(\"OUT_DIR\");").unwrap();
+    // A byte-order mark is valid UTF-8, so rustc compiles this file.
+    let bom = dir.path().join("bom.rs");
+    std::fs::write(
+        &bom,
+        b"\xef\xbb\xbf pub const OUT: &str = env!(\"OUT_DIR\");",
+    )
+    .unwrap();
+
+    let hasher = FileHasher::new();
+    assert_eq!(
+        hasher.env_dep_use(&blob, "OUT_DIR").unwrap(),
+        SourceEnvDepUse::RuntimeValue
+    );
+    assert_eq!(
+        hasher.env_dep_use(&bom, "OUT_DIR").unwrap(),
+        SourceEnvDepUse::RuntimeValue
+    );
+}
+
+#[test]
+fn non_utf8_env_scan_replaces_version_five_memos() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = dir.path().join("template.rs");
+    std::fs::write(&blob, b"\xff include!(env!(\"OUT_DIR\"));").unwrap();
+    let hash = hash_file(&blob).unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let cache = FileHashCache::open(&db).unwrap();
+    cache
+        .put_source_env_dep_use(
+            &hash,
+            "OUT_DIR",
+            5,
+            SourceEnvDepUse::IncludeLocator.memo_code(),
+        )
+        .unwrap();
+    drop(cache);
+
+    let hasher = FileHasher::persistent(&db);
+    assert_eq!(
+        hasher.env_dep_use(&blob, "OUT_DIR").unwrap(),
+        SourceEnvDepUse::Unused,
+        "the lossy scanner's version-five answer must be rescanned"
+    );
+    drop(hasher);
+
+    let cache = FileHashCache::open(&db).unwrap();
+    assert_eq!(
+        cache.get_source_env_dep_use(&hash, "OUT_DIR", 7).unwrap(),
+        Some(SourceEnvDepUse::Unused.memo_code())
+    );
+    drop(cache);
+
+    // A new wrapper can reuse the updated answer without reading the blob.
+    std::fs::remove_file(&blob).unwrap();
+    assert_eq!(
+        FileHasher::persistent(&db)
+            .env_dep_use_for_hash(&blob, "OUT_DIR", &hash)
+            .unwrap(),
+        SourceEnvDepUse::Unused
+    );
+}
+
+#[test]
+fn non_utf8_runtime_use_rescans_version_six_unused_memos() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("template.bin");
+    std::fs::write(&source, b"//\xff\npub const OUT: &str = env!(\"OUT_DIR\");").unwrap();
+    let hash = hash_file(&source).unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let cache = FileHashCache::open(&db).unwrap();
+    cache
+        .put_source_env_dep_use(&hash, "OUT_DIR", 6, SourceEnvDepUse::Unused.memo_code())
+        .unwrap();
+    drop(cache);
+    let hasher = FileHasher::persistent(&db);
+    assert_eq!(
+        hasher.env_dep_use(&source, "OUT_DIR").unwrap(),
+        SourceEnvDepUse::RuntimeValue,
+        "the binary-skip scanner's version-six answer must be rescanned"
+    );
+    drop(hasher);
+    let cache = FileHashCache::open(&db).unwrap();
+    assert_eq!(
+        cache.get_source_env_dep_use(&hash, "OUT_DIR", 7).unwrap(),
+        Some(SourceEnvDepUse::RuntimeValue.memo_code())
+    );
+}
+
+#[test]
+fn non_utf8_files_cannot_supply_proof_but_retain_runtime_vetoes() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, b"include_bytes!(env!(\"OUT_DIR\"));").unwrap();
+    let false_proof = dir.path().join("template.rs");
+    std::fs::write(&false_proof, b"\xff include!(env!(\"OUT_DIR\"));").unwrap();
+    let binary_value = dir.path().join("binary.bin");
+    std::fs::write(
+        &binary_value,
+        b"\xff pub const OUT: &str = env!(\"OUT_DIR\");",
+    )
+    .unwrap();
+    let text_value = dir.path().join("text.bin");
+    std::fs::write(&text_value, b"pub const OUT: &str = env!(\"OUT_DIR\");").unwrap();
+    let unused = dir.path().join("unused.bin");
+    std::fs::write(&unused, b"\xff\x00payload").unwrap();
+    let hasher = FileHasher::new();
+
+    assert_eq!(
+        env_dep_source_decision("OUT_DIR", &[false_proof], &hasher),
+        EnvDepNormalizationDecision::KeptAbsoluteNoIncludeProof
+    );
+    assert_eq!(
+        env_dep_source_decision("OUT_DIR", &[source.clone(), unused], &hasher),
+        EnvDepNormalizationDecision::NormalizedPathOnly
+    );
+    assert_eq!(
+        env_dep_source_decision("OUT_DIR", &[source.clone(), binary_value], &hasher),
+        EnvDepNormalizationDecision::KeptAbsoluteRuntimeUse
+    );
+    assert_eq!(
+        env_dep_source_decision("OUT_DIR", &[source, text_value], &hasher),
+        EnvDepNormalizationDecision::KeptAbsoluteRuntimeUse
+    );
+}
+
+#[test]
+fn non_utf8_env_names_and_prefixes_are_unknown_runtime_uses() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = dir.path().join("template.bin");
+    for source in [
+        b"//\xff\nenv!(\"OUT_\xffDIR\");".as_slice(),
+        b"//\xff\noption_env!(\"OUT_\xc2\x85\xffDIR\");",
+        b"//\xff\nenv!(concat!(\"OTHER_\xff\", \"VALUE\"));",
+    ] {
+        std::fs::write(&blob, source).unwrap();
+        assert_eq!(
+            FileHasher::new().env_dep_use(&blob, "OUT_DIR").unwrap(),
+            SourceEnvDepUse::RuntimeValue,
+            "an invalid literal cannot exclude the requested variable"
+        );
+    }
+}
+
+#[test]
+fn byte_env_scan_matches_lossy_char_boundaries() {
+    let characters: &[&[u8]] = &[
+        b"a",
+        "é".as_bytes(),
+        "中".as_bytes(),
+        "🦀".as_bytes(),
+        b"\xff",
+        b"\xe2\x82",
+        b"\xf0\x9f\xa6",
+    ];
+    for character in characters {
+        for (tail, expected) in [
+            (
+                b"'; const S: &str = \"env!(\\\"OUT_DIR\\\")\";".as_slice(),
+                SourceEnvDepUse::Unused,
+            ),
+            (
+                b"'\xff; const S: &str = \"env!(\\\"OUT_DIR\\\")\";",
+                SourceEnvDepUse::Unused,
+            ),
+            (b"'; env!(\"OUT_DIR\");", SourceEnvDepUse::RuntimeValue),
+            // An incomplete UTF-8 suffix must not widen the preceding char.
+            (
+                b"'\xe2'\"'; env!(\"OUT_DIR\");",
+                SourceEnvDepUse::RuntimeValue,
+            ),
+            (
+                b"'\xe2\x82'\"'; env!(\"OUT_DIR\");",
+                SourceEnvDepUse::RuntimeValue,
+            ),
+        ] {
+            let source = [b"'".as_slice(), *character, tail].concat();
+            assert_eq!(
+                source_env_dep_use_bytes(&source, "OUT_DIR"),
+                expected,
+                "{source:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn non_utf8_concat_binding_veto_survives_without_include_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let binding = dir.path().join("binding.rs");
+    let include = dir.path().join("lib.rs");
+    std::fs::write(
+        &include,
+        b"include_bytes!(env!(\"OUT_DIR\")); env!(concat!(\"OTHER_\", \"VALUE\"));",
+    )
+    .unwrap();
+    for declaration in [
+        "use custom::*;",
+        "use custom::concat;",
+        "#[macro_use] extern crate custom;",
+    ] {
+        std::fs::write(
+            &binding,
+            [
+                b"//\xff\n".as_slice(),
+                declaration.as_bytes(),
+                b" include_bytes!(env!(\"OUT_DIR\"));",
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let hasher = FileHasher::new();
+        assert_eq!(
+            hasher.env_dep_use(&binding, "OUT_DIR").unwrap(),
+            SourceEnvDepUse::ConcatBinding {
+                include_locator: false
+            }
+        );
+        assert_eq!(
+            env_dep_source_decision("OUT_DIR", &[binding.clone(), include.clone()], &hasher),
+            EnvDepNormalizationDecision::KeptAbsoluteRuntimeUse
+        );
+    }
+}
+
+#[test]
+fn non_utf8_concat_prefix_does_not_supply_include_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("template.rs");
+    std::fs::write(
+        &source,
+        b"//\xff\ninclude_bytes!(env!(\"OUT_DIR\")); env!(concat!(\"OTHER_\", \"VALUE\"));",
+    )
+    .unwrap();
+    let hasher = FileHasher::new();
+    assert_eq!(
+        hasher.env_dep_use(&source, "OUT_DIR").unwrap(),
+        SourceEnvDepUse::ConcatPrefix {
+            include_locator: false
+        }
+    );
+    assert_eq!(
+        env_dep_source_decision("OUT_DIR", &[source], &hasher),
+        EnvDepNormalizationDecision::KeptAbsoluteNoIncludeProof
+    );
+}
+
+#[test]
+fn non_utf8_env_scan_checks_content_before_classification() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = dir.path().join("blob.bin");
+    std::fs::write(&blob, b"\xff").unwrap();
+    let old_hash = blake3::hash(b"previous contents").to_hex().to_string();
+    let error = FileHasher::new()
+        .scan_env_dep_use(&blob, "OUT_DIR", &old_hash)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("changed between content hashing"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
 fn cc_preprocess_memo_support_requires_persistent_cache() {
     assert!(!FileHasher::new().supports_cc_preprocess_memo());
 
@@ -17709,4 +17977,142 @@ fn concurrent_key_env_snapshots_do_not_use_the_servers_values() {
         );
         assert!(key_env_guard_in(&patterns, env).is_some());
     }
+}
+
+#[test]
+fn non_utf8_proc_macro_template_keeps_runtime_env_absolute() {
+    let _lock = key_test_lock();
+    let invocation = InvocationEnv::capture();
+    let rustc = invocation.var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let compiler = || {
+        let mut command = invocation.command(&rustc).expect("resolve native rustc");
+        for name in [
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_BUILD_RUSTC_WRAPPER",
+        ] {
+            command.env_remove(name);
+        }
+        command
+    };
+    fn run(command: &mut std::process::Command) -> std::process::Output {
+        use crate::invocation::process::CommandExt as _;
+        let output = command.invocation_output().expect("run compiler control");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let decoder = root.join("decoder.rs");
+    std::fs::write(
+        &decoder,
+        r#"extern crate proc_macro;
+#[proc_macro]
+pub fn decode(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let path = std::path::Path::new(&root).join("template.bin");
+    let bytes = std::fs::read(&path).unwrap();
+    let decoded = String::from_utf8_lossy(&bytes);
+    format!("const _: &[u8] = include_bytes!({:?});\n{}", path.to_str().unwrap(), decoded)
+        .parse().unwrap()
+}
+"#,
+    )
+    .unwrap();
+    let template = root.join("template.bin");
+    std::fs::write(
+        &template,
+        b"//\xff\npub const OUT_VALUE: &str = env!(\"OUT_DIR\");\n",
+    )
+    .unwrap();
+    let source = root.join("main.rs");
+    std::fs::write(
+        &source,
+        r#"decoder::decode!();
+const _: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/payload.bin"));
+fn main() { println!("{OUT_VALUE}"); }
+"#,
+    )
+    .unwrap();
+    let library = root.join(format!(
+        "{}decoder{}",
+        std::env::consts::DLL_PREFIX,
+        std::env::consts::DLL_SUFFIX
+    ));
+    run(compiler()
+        .args([
+            "--edition=2021",
+            "--crate-type=proc-macro",
+            "--crate-name=decoder",
+        ])
+        .arg(&decoder)
+        .arg("-o")
+        .arg(&library));
+
+    let normalizer = PathNormalizer::empty().with_base_dirs(&[root.to_string_lossy().into_owned()]);
+    let mut values = Vec::new();
+    for location in ["a", "b"] {
+        let build = root.join(location);
+        let out = build.join("consumer-0123456789abcdef/out");
+        std::fs::create_dir_all(&out).unwrap();
+        let payload = out.join("payload.bin");
+        std::fs::write(&payload, b"same payload").unwrap();
+        let dep_file = build.join("consumer.d");
+        let binary = build.join(format!("consumer{}", std::env::consts::EXE_SUFFIX));
+        run(compiler()
+            .args(["--edition=2021", "--crate-name=consumer"])
+            .arg(&source)
+            .arg("--extern")
+            .arg(format!("decoder={}", library.display()))
+            .arg(format!("--emit=link,dep-info={}", dep_file.display()))
+            .arg("-o")
+            .arg(&binary)
+            .env("CARGO_MANIFEST_DIR", &root)
+            .env("OUT_DIR", &out));
+
+        let printed = run(&mut invocation.command(&binary).unwrap());
+        let printed = String::from_utf8(printed.stdout).unwrap();
+        let expected = out.to_str().unwrap();
+        assert_eq!(printed.trim_end(), expected);
+        let dep_info = read_dep_info_file(&dep_file).unwrap();
+        let sources = parse_dep_info(&dep_info);
+        for input in [&source, &template, &payload] {
+            assert!(
+                sources
+                    .iter()
+                    .any(|path| path_probe(path) == path_probe(input)),
+                "rustc did not track {}: {dep_info}",
+                input.display()
+            );
+        }
+        assert_eq!(
+            parse_env_dep_info(&dep_info)
+                .into_iter()
+                .find(|(name, _)| name == "OUT_DIR")
+                .expect("rustc tracked OUT_DIR")
+                .1,
+            Some(expected.to_string())
+        );
+        let normalized = normalize_env_dep_value_in(
+            "consumer",
+            "OUT_DIR",
+            expected,
+            &sources,
+            &normalizer,
+            Some(out.as_os_str()),
+        );
+        assert_eq!(
+            normalized.decision,
+            EnvDepNormalizationDecision::KeptAbsoluteRuntimeUse
+        );
+        assert_eq!(normalized.value, expected);
+        values.push(normalized.value);
+    }
+    assert_ne!(values[0], values[1]);
 }
