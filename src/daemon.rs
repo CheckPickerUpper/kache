@@ -2106,6 +2106,18 @@ impl Daemon {
         (result, lock_wait_ms, import_ms)
     }
 
+    fn discard_uncommitted_packed_entries(
+        &self,
+        entries: &[crate::store::VerifiedRestoredEntry],
+    ) -> Result<()> {
+        self.with_store(|store| {
+            for entry in entries {
+                store.discard_uncommitted_restored_entry(&entry.cache_key)?;
+            }
+            Ok(())
+        })
+    }
+
     pub(crate) fn entry_dir_for(&self, cache_key: &str) -> PathBuf {
         // Defense-in-depth: every caller must validate untrusted keys before
         // reaching here (see `is_valid_cache_key`), so a malformed key getting
@@ -2832,12 +2844,23 @@ impl Daemon {
         Response::ok()
     }
 
-    /// Flush a batch of entries stored without an fsync. Uses its own store
-    /// connection, as GC does, so a sweep of slow writes never holds the
-    /// mutex a lookup needs.
+    /// Flush a batch of entries stored without an fsync, in the main store and
+    /// in each `[cache.volumes]` shard. Uses its own store connections, as GC
+    /// does, so a sweep of slow writes never holds the mutex a lookup needs.
     fn flush_pending_durability(&self) {
+        Self::flush_store_durability(&self.config);
+        for shard in &self.config.volume_stores {
+            // Opening a shard without an index would create it on a volume
+            // that may not be mounted.
+            if crate::volume_gc::shard_has_index(&shard.store) {
+                Self::flush_store_durability(&self.config.for_volume_store(shard, |_| None));
+            }
+        }
+    }
+
+    fn flush_store_durability(config: &Config) {
         let flushed = (|| -> Result<usize> {
-            let store = Store::open(&self.config)?;
+            let store = Store::open(config)?;
             if store.pending_durability()? == 0 {
                 return Ok(0);
             }
@@ -4544,11 +4567,14 @@ impl Daemon {
                     self.prefetch_stats
                         .pack_validation_failures
                         .fetch_add(1, Ordering::Relaxed);
-                    for (entry, _, pack_index, entry_index) in &verified {
+                    for (_, _, pack_index, entry_index) in &verified {
                         receipts[*pack_index].accounting().entries[*entry_index].outcome =
                             "import_error".to_owned();
-                        let _ =
-                            std::fs::remove_dir_all(self.entry_dir_for(&entry.restored.cache_key));
+                    }
+                    // Strict flushing can fail after registration commits.
+                    // Preserve those rows' metadata, including existing keys.
+                    if let Err(cleanup_error) = self.discard_uncommitted_packed_entries(&batch) {
+                        tracing::warn!("packed-prefetch residue cleanup failed: {cleanup_error:#}");
                     }
                 }
             }
@@ -6591,7 +6617,8 @@ async fn server_main(
         }
     });
 
-    // Entries a miss stored without an fsync (`cache.deferred_durability`).
+    // Entries a miss or a download stored without an fsync
+    // (`cache.deferred_durability`).
     // Short interval: until an entry is flushed every hit on it re-reads its
     // blobs to verify them, and the wrapper hands the work here precisely so
     // the build does not wait for the disk.
