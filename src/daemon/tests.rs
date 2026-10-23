@@ -15300,3 +15300,144 @@ fn daemon_stats_include_rotated_events() {
     assert_eq!(snapshot.events.local_hits, 12);
     assert_eq!(snapshot.events.misses, 1);
 }
+
+/// Run `work` on a thread and fail the test if it has not finished in 20 s:
+/// the hang these tests guard against must fail them, not stall the run.
+#[cfg(windows)]
+fn within_20s<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    let (done, finished) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(work());
+    });
+    finished
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the request hung on a stalled daemon pipe")
+}
+
+/// A daemon that stopped accepting: its only pipe instance is taken. A
+/// fire-and-forget request gives up within its wait instead of holding the
+/// wrapper until the pipe frees.
+#[cfg(windows)]
+#[test]
+fn a_fire_and_forget_request_to_a_busy_pipe_gives_up_within_its_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("daemon.sock");
+    let _listener = ListenerOptions::new()
+        .name(socket_name(&socket).unwrap())
+        .create_sync()
+        .expect("bind listener");
+    let _first =
+        crate::transport::connect_sync(&socket, Duration::from_millis(300)).expect("first client");
+
+    let started = std::time::Instant::now();
+    let result = within_20s(move || {
+        send_line_fire_and_forget(&socket, "{}\n".to_owned(), Duration::from_millis(500))
+    });
+    let waited = started.elapsed();
+    assert!(result.is_err(), "a busy pipe cannot take the request");
+    assert!(waited < Duration::from_secs(5), "{waited:?}");
+}
+
+/// A daemon that accepted the pipe but never reads it: a request larger than
+/// the pipe's buffer cannot be written in full. Windows pipes have no send
+/// timeout, so the wait bounds the whole hand-off.
+#[cfg(windows)]
+#[test]
+fn a_fire_and_forget_request_to_a_daemon_that_never_reads_gives_up_within_its_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("daemon.sock");
+    let _listener = ListenerOptions::new()
+        .name(socket_name(&socket).unwrap())
+        .create_sync()
+        .expect("bind listener");
+
+    let line = format!("{}\n", "x".repeat(4 << 20));
+    let started = std::time::Instant::now();
+    let result =
+        within_20s(move || send_line_fire_and_forget(&socket, line, Duration::from_millis(500)));
+    let waited = started.elapsed();
+    assert!(result.is_err(), "4 MiB cannot fit in a pipe nobody reads");
+    assert!(waited < Duration::from_secs(5), "{waited:?}");
+}
+
+/// The same hand-off still delivers its line to a daemon that reads it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fire_and_forget_request_reaches_a_daemon_that_reads_it() {
+    use tokio::io::AsyncBufReadExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("daemon.sock");
+    let listener = crate::transport::bind_daemon_listener(&socket)
+        .await
+        .unwrap()
+        .unwrap();
+    let line = format!("{{\"pad\":\"{}\"}}\n", "y".repeat(256 << 10));
+    let expected = line.clone();
+    let (release, held) = tokio::sync::oneshot::channel();
+    let reader = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let stream = listener.accept().await.expect("accept");
+            #[cfg(windows)]
+            let _discard = crate::transport::discard_pipe_writes_on_drop(&stream);
+            let mut received = String::new();
+            tokio::io::BufReader::new(&stream)
+                .read_line(&mut received)
+                .await
+                .unwrap();
+            held.await.unwrap();
+            received
+        })
+        .await
+        .expect("the fire-and-forget request was never delivered")
+    });
+    tokio::task::spawn_blocking(move || {
+        send_line_fire_and_forget(&socket, line, Duration::from_secs(10))
+    })
+    .await
+    .unwrap()
+    .expect("send");
+    release.send(()).unwrap();
+    assert_eq!(reader.await.unwrap(), expected);
+}
+
+/// Measure the actual request, including creation and destruction of its
+/// runtime, against a pipe whose only instance remains occupied.
+#[cfg(windows)]
+#[test]
+fn a_busy_windows_request_honors_its_short_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("request-busy.sock");
+    let _listener = ListenerOptions::new()
+        .name(socket_name(&socket).unwrap())
+        .create_sync()
+        .unwrap();
+    let _first = crate::transport::connect_sync(&socket, Duration::ZERO).unwrap();
+    let started = Instant::now();
+    let result = within_20s(move || {
+        send_request_with_timeout(&socket, &Request::Health, Duration::from_millis(75))
+    });
+    assert!(result.is_err());
+    assert!(started.elapsed() < Duration::from_millis(750));
+}
+
+/// Even a short write that fits in the kernel buffer must not escape into
+/// interprocess's unbounded background flush when the peer never reads.
+#[cfg(windows)]
+#[test]
+fn a_buffered_fire_and_forget_request_is_bounded_through_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("buffered-write.sock");
+    let _listener = ListenerOptions::new()
+        .name(socket_name(&socket).unwrap())
+        .create_sync()
+        .unwrap();
+    let started = Instant::now();
+    let result = within_20s(move || {
+        send_line_fire_and_forget(&socket, "{}\n".to_owned(), Duration::from_millis(500))
+    });
+    assert!(
+        result.is_err(),
+        "a peer that never reads cannot finish a flush"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
