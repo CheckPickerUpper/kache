@@ -308,7 +308,6 @@ fn try_hard_link(src: &Path, dst: &Path) -> std::io::Result<()> {
     if let Some(kind) = injected_restore_hardlink_error() {
         return Err(std::io::Error::new(kind, "injected hardlink failure"));
     }
-    #[cfg(target_os = "linux")]
     if let Some(result) =
         crate::workspace::dispatch(crate::workspace::Operation::Hardlink(src, dst))
     {
@@ -437,7 +436,6 @@ pub enum LinkStrategy {
 
 #[cfg(not(windows))]
 fn remove_restore_file(path: &Path) -> std::io::Result<()> {
-    #[cfg(target_os = "linux")]
     if let Some(result) = crate::workspace::dispatch(crate::workspace::Operation::Remove(path)) {
         return result;
     }
@@ -445,7 +443,6 @@ fn remove_restore_file(path: &Path) -> std::io::Result<()> {
 }
 
 fn create_restore_directories(path: &Path) -> std::io::Result<()> {
-    #[cfg(target_os = "linux")]
     if let Some(result) =
         crate::workspace::dispatch(crate::workspace::Operation::CreateDirectories(path))
     {
@@ -1136,6 +1133,18 @@ fn windows_volume_root(path: &Path) -> Option<String> {
     Some(String::from_utf16_lossy(&root[..len]))
 }
 
+fn writable_mode(permissions: &fs::Permissions) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.mode() & 0o777
+    }
+    #[cfg(windows)]
+    {
+        if permissions.readonly() { 0o444 } else { 0o644 }
+    }
+}
+
 /// Grant owner write access on an independent restore, retaining other bits.
 /// Call only after the target is known to have its own inode.
 fn set_owner_write_permission(path: &Path) -> Result<()> {
@@ -1147,10 +1156,9 @@ fn set_owner_write_permission(path: &Path) -> Result<()> {
     }
     #[cfg(not(unix))]
     permissions.set_readonly(false);
-    #[cfg(target_os = "linux")]
     if let Some(result) = crate::workspace::dispatch(crate::workspace::Operation::Permissions(
         path,
-        std::os::unix::fs::PermissionsExt::mode(&permissions),
+        writable_mode(&permissions),
     )) {
         return result.map_err(Into::into);
     }
@@ -1161,7 +1169,6 @@ fn set_owner_write_permission(path: &Path) -> Result<()> {
 /// Set 0o755 after an executable/dylib reflink. Reflink preserves the store
 /// blob's read-only mode, but runtime-loaded artifacts must be executable.
 fn set_executable_permissions(path: &Path) -> Result<()> {
-    #[cfg(target_os = "linux")]
     if let Some(result) =
         crate::workspace::dispatch(crate::workspace::Operation::Permissions(path, 0o755))
     {
@@ -1173,7 +1180,6 @@ fn set_executable_permissions(path: &Path) -> Result<()> {
 
 /// Clone a file using the shared filesystem implementation.
 pub fn try_reflink(src: &Path, dst: &Path) -> Result<()> {
-    #[cfg(target_os = "linux")]
     if let Some(result) = crate::workspace::dispatch(crate::workspace::Operation::Reflink(src, dst))
     {
         return result.map_err(Into::into);
@@ -1184,7 +1190,6 @@ pub fn try_reflink(src: &Path, dst: &Path) -> Result<()> {
 /// Regular file copy with appropriate permissions.
 /// `executable`: if true, sets 0o755 (rwxr-xr-x); otherwise 0o644 (rw-r--r--).
 fn copy_file(src: &Path, dst: &Path, executable: bool) -> Result<()> {
-    #[cfg(target_os = "linux")]
     if let Some(result) =
         crate::workspace::dispatch(crate::workspace::Operation::Copy(src, dst, executable))
     {
@@ -1218,7 +1223,6 @@ pub struct PreparedWritableTarget {
 enum WritableStage {
     Staged(kache_fs::StagedFile),
     Cloned(ClonedFile),
-    #[cfg(target_os = "linux")]
     Client(crate::workspace::Prepared),
 }
 
@@ -1265,7 +1269,6 @@ impl PreparedWritableTarget {
             reflinked,
         } = self;
         match stage {
-            #[cfg(target_os = "linux")]
             WritableStage::Client(stage) => stage.publish(false)?,
             WritableStage::Staged(staged) => staged.publish_new(&target).with_context(|| {
                 format!(
@@ -1300,7 +1303,6 @@ impl PreparedWritableTarget {
             reflinked,
         } = self;
         match stage {
-            #[cfg(target_os = "linux")]
             WritableStage::Client(stage) => stage.publish(true)?,
             WritableStage::Staged(staged) => staged
                 .replace(&target)
@@ -1339,7 +1341,6 @@ pub fn prepare_writable_target_from_file(
     src: &Path,
     target: &Path,
 ) -> Result<PreparedWritableTarget> {
-    #[cfg(target_os = "linux")]
     if let Some(owner) = crate::workspace::current() {
         let (stage, bytes, reflinked) = crate::workspace::Prepared::new(
             owner,
@@ -1545,7 +1546,6 @@ pub fn prepare_writable_target_from_bytes(
     target: &Path,
     content: &[u8],
 ) -> Result<PreparedWritableTarget> {
-    #[cfg(target_os = "linux")]
     if let Some(owner) = crate::workspace::current() {
         let (stage, bytes, reflinked) = crate::workspace::Prepared::new(
             owner,
@@ -1579,7 +1579,6 @@ pub fn prepare_writable_target_from_bytes(
 /// write can take its place. A previous restore may have left a
 /// read-only hardlink or reflink of a store blob here.
 fn clear_target(target_path: &Path) -> Result<()> {
-    #[cfg(target_os = "linux")]
     if let Some(result) =
         crate::workspace::dispatch(crate::workspace::Operation::Remove(target_path))
     {
@@ -1618,7 +1617,6 @@ fn clear_target(target_path: &Path) -> Result<()> {
 /// holds no matter which path materializes the file — including a future
 /// content transform applied to an executable artifact (issue #298).
 pub fn write_restored(target_path: &Path, content: &[u8], strategy: LinkStrategy) -> Result<()> {
-    #[cfg(target_os = "linux")]
     if let Some(result) = crate::workspace::dispatch(crate::workspace::Operation::Write(
         target_path,
         content,
@@ -1704,7 +1702,6 @@ pub fn write_restored(target_path: &Path, content: &[u8], strategy: LinkStrategy
 /// green in the e2e suite on APFS but not the same mechanism), and network /
 /// FUSE filesystems make no such guarantee.
 pub fn touch_mtime_write_clock(path: &Path) -> Result<()> {
-    #[cfg(target_os = "linux")]
     if let Some(result) = crate::workspace::dispatch(crate::workspace::Operation::Touch(path)) {
         return result.map_err(Into::into);
     }
@@ -1824,52 +1821,9 @@ pub fn touch_mtime_write_clock(path: &Path) -> Result<()> {
 /// writable); the caller propagates it, degrading to a recompile.
 #[cfg(not(unix))]
 fn sample_write_clock(path: &Path) -> Result<filetime::FileTime> {
-    use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let dir = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-
-    // `create_new` refuses to open an existing file (and does not follow a
-    // symlink/reparse point squatting on the name), so a PID-reuse leftover
-    // or a planted file can never be truncated or sampled — the attempt
-    // just moves to the next name. Leftovers from a crash between create
-    // and remove are benign litter under a distinctive dotted name.
-    let mut last_err: Option<std::io::Error> = None;
-    for _ in 0..8 {
-        let probe = dir.join(format!(
-            ".kache-clock-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let created = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&probe);
-        let mut file = match created {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => {
-                last_err = Some(e);
-                break;
-            }
-        };
-        let sampled = (|| {
-            file.write_all(b"t")?;
-            drop(file);
-            let meta = fs::metadata(&probe)?;
-            Ok::<_, std::io::Error>(filetime::FileTime::from_last_modification_time(&meta))
-        })();
-        let _ = fs::remove_file(&probe);
-        return sampled.with_context(|| format!("write-clock probe {}", probe.display()));
-    }
-    Err(last_err
-        .map(anyhow::Error::from)
-        .unwrap_or_else(|| anyhow::anyhow!("no free probe name after 8 attempts")))
-    .with_context(|| format!("creating write-clock probe in {}", dir.display()))
+    kache_fs::sample_write_clock(path)
+        .map(filetime::FileTime::from_system_time)
+        .with_context(|| format!("sampling write clock next to {}", path.display()))
 }
 
 const DEPINFO_ROOT_SENTINEL: &str = "__kache_root__/";
@@ -2513,6 +2467,15 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_modes_preserve_permissions_and_remove_file_type_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        for (mode, expected) in [(0o100754, 0o754), (0o104640, 0o640), (0o100000, 0)] {
+            assert_eq!(writable_mode(&fs::Permissions::from_mode(mode)), expected);
+        }
+    }
 
     fn configure_invocation_policy(enabled: bool, marker: &Path) {
         set_windows_hardlink_restore(enabled);
