@@ -879,6 +879,7 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
             verify,
             checksums,
             repair,
+            probe,
         }) => {
             if json && !doctor_json_is_read_only(fix, purge_sccache, verify, checksums, repair) {
                 return Err(machine::invalid_arguments(
@@ -891,6 +892,7 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
                 verify || checksums || repair,
                 checksums,
                 repair,
+                probe,
                 json,
             )
         }
@@ -2611,6 +2613,14 @@ mod tests {
             assert!(is_invalid_arguments(&err), "{err:#}");
             assert!(err.to_string().contains("invalid --max-age"), "{err}");
         }
+    }
+
+    #[test]
+    fn run_cli_rejects_unsupported_json_before_loading_configuration() {
+        let cli = Cli::try_parse_from(["kache", "config", "--json"]).unwrap();
+        let error = run_cli(cli, None).unwrap_err();
+        assert!(is_invalid_arguments(&error), "{error:#}");
+        assert!(error.to_string().contains("config"), "{error:#}");
     }
 
     #[test]
