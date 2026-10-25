@@ -2787,13 +2787,6 @@ fn test_compute_project_stats_classifies_remaining_buckets() {
 }
 
 #[test]
-fn test_parse_cargo_lock_crate_names_nonexistent() {
-    // When Cargo.lock doesn't exist in cwd, should return None
-    // We can't guarantee cwd lacks Cargo.lock, so just test the function doesn't panic
-    let _ = parse_cargo_lock_crate_names();
-}
-
-#[test]
 fn test_parse_cargo_lock_crate_names_from_valid_missing_and_bad_files() {
     // Cargo.lock parser -> valid names, missing file, and malformed TOML.
     let dir = tempfile::tempdir().unwrap();
@@ -3424,9 +3417,12 @@ fn test_get_workspace_crate_names_lists_members() {
         std::fs::write(root.join(m).join("src/lib.rs"), "").unwrap();
     }
 
-    let names = get_workspace_crate_names(root.join("Cargo.toml").to_str().unwrap()).unwrap();
-    assert!(names.contains(&"a".to_string()), "got {names:?}");
-    assert!(names.contains(&"b".to_string()), "got {names:?}");
+    let names = sync_scope::resolve(Some(root.join("Cargo.toml").to_str().unwrap()), false)
+        .unwrap()
+        .workspace
+        .unwrap();
+    assert!(names.contains("a"), "got {names:?}");
+    assert!(names.contains("b"), "got {names:?}");
 }
 
 #[test]
@@ -3434,18 +3430,7 @@ fn test_get_workspace_crate_names_errors_on_bad_manifest() {
     let dir = tempfile::tempdir().unwrap();
     let bad = dir.path().join("Cargo.toml");
     std::fs::write(&bad, "this is not valid toml [[[").unwrap();
-    assert!(get_workspace_crate_names(bad.to_str().unwrap()).is_err());
-}
-
-#[test]
-fn test_workspace_filter_bad_manifest_is_empty_set() {
-    // Explicit bad manifest path -> warning branch with empty filter.
-    let dir = tempfile::tempdir().unwrap();
-    let bad = dir.path().join("Cargo.toml");
-    std::fs::write(&bad, "not toml [[[[").unwrap();
-
-    let filter = workspace_filter(Some(bad.to_str().unwrap())).unwrap();
-    assert!(filter.is_empty());
+    assert!(sync_scope::resolve(Some(bad.to_str().unwrap()), false).is_err());
 }
 
 // ── backend-neutral remote tests ──────────────────────────────────────────
@@ -6971,6 +6956,74 @@ fn build_entry_pack(key: &str, crate_name: &str) -> Vec<u8> {
     let meta: crate::store::EntryMeta =
         serde_json::from_slice(&std::fs::read(entry_dir.join("meta.json")).unwrap()).unwrap();
     crate::remote_layout::create_entry_pack_zstd(&entry_dir, &store.blobs_dir(), &meta, 3).unwrap()
+}
+
+#[tokio::test]
+async fn lockfile_sync_pulls_hyphenated_packages_from_compiler_crate_prefixes() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+    let store = Store::open(&config).unwrap();
+    let remote = test_remote_cfg();
+    let backend = TestBackend::memory();
+    let packages = [
+        ("aho-corasick", "aho_corasick"),
+        ("wasm-bindgen-shared", "wasm_bindgen_shared"),
+        ("serde", "serde"),
+    ];
+    let lock = dir.path().join("Cargo.lock");
+    let mut content = String::from("version = 3\n");
+    let mut expected_lists = Vec::new();
+    let mut expected_gets = Vec::new();
+    let mut keys = Vec::new();
+    for (package, crate_name) in packages {
+        content.push_str(&format!(
+            "\n[[package]]\nname = {package:?}\nversion = \"1.0.0\"\n"
+        ));
+        let key = sync_test_cache_key(crate_name);
+        backend
+            .seed(
+                &format!("prefix/v3/manifests/{crate_name}/{key}.json"),
+                b"{}".to_vec(),
+            )
+            .await;
+        let pack_path = format!("prefix/v3/packs/{crate_name}/{key}.tar.zst");
+        backend
+            .seed(&pack_path, build_entry_pack(&key, crate_name))
+            .await;
+        expected_lists.push(format!("prefix/v3/manifests/{crate_name}/"));
+        expected_gets.push(pack_path);
+        keys.push(key);
+    }
+    // Different versions of one package still need only one prefix listing.
+    content.push_str("\n[[package]]\nname = \"aho-corasick\"\nversion = \"2.0.0\"\n");
+    std::fs::write(&lock, content).unwrap();
+    let crates = parse_cargo_lock_crate_names_from(&lock).unwrap();
+    sync_with_client(
+        &as_cache_remote(as_remote_backend(&backend), &remote),
+        &config,
+        &store,
+        None,
+        true,
+        false,
+        false,
+        false,
+        Some(&crates),
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    let mut listed = backend.list_calls();
+    listed.sort();
+    expected_lists.sort();
+    assert_eq!(listed, expected_lists);
+    let mut downloaded = backend.get_calls();
+    downloaded.sort();
+    expected_gets.sort();
+    assert_eq!(downloaded, expected_gets);
+    for key in keys {
+        assert!(config.store_dir().join(key).join("meta.json").exists());
+    }
 }
 
 #[tokio::test]
