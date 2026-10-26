@@ -14961,6 +14961,54 @@ fn env_with(name: &str, value: &str) -> KeyEnv {
     KeyEnv::from_parts([(name, value)], None)
 }
 
+#[cfg(unix)]
+#[test]
+fn private_home_and_xdg_roots_do_not_change_the_cache_key() -> Result<()> {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir()?;
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, "pub fn value() {}\n")?;
+    let compiler = dir.path().join("rustc");
+    // The key needs a version identity; the supplied source closure below
+    // avoids compiling or asking an installed toolchain for dep-info.
+    kache_fs::testutil::write_executable(
+        &compiler,
+        format!("#!/bin/sh\nprintf '%s' '{GNU_RUSTC_VERSION}'\n"),
+    );
+    let mut args = RustcArgs::parse(&base_args(&source))?;
+    args.rustc = compiler;
+    let normalizer = PathNormalizer::empty();
+    let key_in = |private_root: &Path| -> Result<String> {
+        let vars = [
+            ("HOME", private_root.to_path_buf()),
+            ("XDG_CONFIG_HOME", private_root.join("config")),
+            ("XDG_CACHE_HOME", private_root.join("cache")),
+            ("XDG_DATA_HOME", private_root.join("data")),
+            ("XDG_STATE_HOME", private_root.join("state")),
+            ("XDG_RUNTIME_DIR", private_root.join("run")),
+        ];
+        for (_, path) in &vars {
+            std::fs::create_dir_all(path)?;
+        }
+        let env = KeyEnv::from_parts(vars, Some(dir.path().to_path_buf()));
+        provide_dep_info(
+            DepInfo {
+                source_files: vec![source.clone()],
+                env_deps: Vec::new(),
+            },
+            None,
+        );
+        compute_cache_key_with_outputs(&args, &FileHasher::new(), &normalizer, &env).0
+    };
+    let key_a = key_in(&dir.path().join("private-a"))?;
+    let key_b = key_in(&dir.path().join("private-b"))?;
+    assert_eq!(
+        key_a, key_b,
+        "private HOME/XDG roots must not partition the canonical cache key"
+    );
+    Ok(())
+}
+
 fn restore_env_var(key: &str, old: Option<std::ffi::OsString>) {
     match old {
         Some(value) => unsafe { std::env::set_var(key, value) },
