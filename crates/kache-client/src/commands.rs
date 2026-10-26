@@ -309,6 +309,11 @@ enum Commands {
         /// misses with the build before it
         crate_name: Option<String>,
 
+        /// List every skip and passthrough across the retained build history,
+        /// with counts by reason and the affected crates
+        #[arg(long, conflicts_with = "crate_name")]
+        all: bool,
+
         /// Without a crate: only builds recorded for this build tree
         #[arg(long, conflicts_with = "crate_name")]
         root: Option<PathBuf>,

@@ -1065,12 +1065,16 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
             cli::telemetry_push(&config, &selection, &labels, dry_run)
         }
         Some(Commands::Explain {
+            all: true, root, ..
+        }) => explain::run_all(&config, root.as_deref(), json),
+        Some(Commands::Explain {
             crate_name: Some(crate_name),
             ..
         }) => cli::why_miss(&config, &crate_name, json),
         Some(Commands::Explain {
             crate_name: None,
             root,
+            ..
         }) => explain::run(&config, root.as_deref(), json),
         Some(Commands::Diff { root }) => {
             if run_diff::run(&config, root.as_deref(), json)? {
@@ -2898,7 +2902,8 @@ mod tests {
             build.command,
             Some(Commands::Explain {
                 crate_name: None,
-                root: Some(_)
+                root: Some(_),
+                ..
             })
         ));
         assert!(Cli::try_parse_from(["kache", "why-miss", "serde", "--root", "x"]).is_err());
