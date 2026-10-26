@@ -37,6 +37,42 @@ pub fn eviction_target(max_size: u64) -> u64 {
     ((max_size as u128 * EVICT_TARGET_PERCENT as u128) / 100) as u64
 }
 
+/// How a size budget treats the bytes a live build output still holds:
+/// blobs whose last store reference an entry holds while a target directory
+/// hardlinks or clones them too. Evicting such an entry frees no disk, so a
+/// sweep keeps it either way; this decides whether its bytes count toward
+/// `max_size`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HeldBytesBudget {
+    /// Left out (kunobi-ninja/kache#1206): a sweep stops once the rest of
+    /// the store is under its target, so the store can stay over `max_size`
+    /// by what build outputs hold.
+    #[default]
+    LeftOut,
+    /// Counted: a sweep evicts other entries until the whole store is under
+    /// its target, so `max_size` bounds everything the store holds.
+    Counted,
+}
+
+impl HeldBytesBudget {
+    /// `[cache] count_held_in_max_size`.
+    pub fn from_count_held_in_max_size(counted: bool) -> Self {
+        if counted {
+            Self::Counted
+        } else {
+            Self::LeftOut
+        }
+    }
+
+    /// The part of `held` bytes the budget leaves out.
+    pub fn left_out(self, held: u64) -> u64 {
+        match self {
+            Self::LeftOut => held,
+            Self::Counted => 0,
+        }
+    }
+}
+
 /// The high edge of GC's hysteresis band: the size a sweep *fires* at.
 ///
 /// Trigger and target were both [`eviction_target`], so "evict to 90% — avoids
