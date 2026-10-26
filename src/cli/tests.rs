@@ -10220,6 +10220,8 @@ fn init_steps_list_each_edit_with_the_backup_before_it() {
         rustdoc: Some("configure"),
         test_runner: Some(SetupStep::new("test_runner", "configure", vec![rc.clone()])),
         test_changes: vec![(rc.clone(), rc_exists)],
+        completions: None,
+        completion_changes: Vec::new(),
         recovery: "keep",
         recovery_path: PathBuf::from("/home/me/.config/kache/config.toml"),
         service: Some("keep"),
@@ -10275,6 +10277,8 @@ fn init_steps_list_each_edit_with_the_backup_before_it() {
         rustdoc: Some("keep"),
         test_runner: None,
         test_changes: Vec::new(),
+        completions: None,
+        completion_changes: Vec::new(),
         recovery: "ask",
         service: None,
         ..facts(true, true, true)
@@ -10399,6 +10403,8 @@ fn a_run_reports_declined_and_failed_steps_as_not_done() {
         rustdoc: Some("configure"),
         test_runner: None,
         test_changes: Vec::new(),
+        completions: None,
+        completion_changes: Vec::new(),
         recovery: "ask",
         recovery_path: PathBuf::from("/home/me/.config/kache/config.toml"),
         service: Some("configure"),
@@ -10431,6 +10437,8 @@ fn a_run_reports_declined_and_failed_steps_as_not_done() {
             rustdoc: None,
             test_runner: None,
             test_changes: Vec::new(),
+            completions: None,
+            completion_changes: Vec::new(),
             recovery: "keep",
             service_installed_now: false,
         },
@@ -10451,6 +10459,8 @@ fn a_run_reports_declined_and_failed_steps_as_not_done() {
             rustdoc: Some("configure"),
             test_runner: None,
             test_changes: Vec::new(),
+            completions: None,
+            completion_changes: Vec::new(),
             recovery: "configure",
             service_installed_now: true,
         },
@@ -10479,6 +10489,8 @@ fn a_run_reports_declined_and_failed_steps_as_not_done() {
             rustdoc: Some("failed"),
             test_runner: None,
             test_changes: Vec::new(),
+            completions: None,
+            completion_changes: Vec::new(),
             recovery: "keep",
             service_installed_now: false,
         },
@@ -10493,6 +10505,40 @@ fn a_run_reports_declined_and_failed_steps_as_not_done() {
         ]
     );
     assert_eq!(components(&kept)[4], "login_service keep");
+
+    // Completion edits are replanned after other shell edits. Report the
+    // backups from the applied plan, not the earlier preview.
+    let completion_path = PathBuf::from("/home/me/.local/share/kache/completions/kache.bash");
+    let completed = run_facts(
+        &SetupFacts {
+            completion_changes: vec![(PathBuf::from("/old-preview"), true)],
+            ..plan
+        },
+        RunOutcome {
+            cargo_applied: false,
+            rustdoc: None,
+            test_runner: None,
+            test_changes: Vec::new(),
+            completions: Some(SetupStep::new(
+                "completions",
+                "configure",
+                vec![completion_path.clone()],
+            )),
+            completion_changes: vec![(completion_path.clone(), true)],
+            recovery: "keep",
+            service_installed_now: false,
+        },
+    );
+    let steps = setup_steps(&completed);
+    let completion = steps.iter().find(|s| s.component == "completions").unwrap();
+    assert_eq!(completion.action, "configure");
+    assert_eq!(
+        completion.paths.as_slice(),
+        std::slice::from_ref(&completion_path)
+    );
+    let backups: Vec<_> = steps.iter().filter(|s| s.component == "backup").collect();
+    assert_eq!(backups.len(), 1);
+    assert_eq!(backups[0].paths, [completion_path]);
 }
 
 #[test]
@@ -10530,6 +10576,8 @@ fn a_run_reports_the_test_runner_it_planned_after_the_shell_edits() {
         rustdoc: None,
         test_runner: Some(SetupStep::new("test_runner", "unsupported", Vec::new())),
         test_changes: Vec::new(),
+        completions: None,
+        completion_changes: Vec::new(),
         recovery: "keep",
         recovery_path: PathBuf::from("/home/me/.config/kache/config.toml"),
         service: None,
@@ -10542,6 +10590,8 @@ fn a_run_reports_the_test_runner_it_planned_after_the_shell_edits() {
             rustdoc: None,
             test_runner: Some(SetupStep::new("test_runner", "configure", vec![rc.clone()])),
             test_changes: vec![(rc.clone(), true)],
+            completions: None,
+            completion_changes: Vec::new(),
             recovery: "keep",
             service_installed_now: false,
         },
