@@ -185,6 +185,20 @@ enum Commands {
         /// Remove entries from old or unrecorded cache-key schemas
         #[arg(long)]
         stale_schema: bool,
+
+        /// Evict entries oldest first until the volume holding --free-path
+        /// has this much free space (e.g. 100G)
+        #[arg(
+            long,
+            value_name = "SIZE",
+            requires = "free_path",
+            conflicts_with_all = ["max_age", "stale_schema"]
+        )]
+        until_free: Option<String>,
+
+        /// The directory whose volume --until-free measures
+        #[arg(long, value_name = "DIR", requires = "until_free")]
+        free_path: Option<PathBuf>,
     },
 
     /// Remove the whole cache or one crate's entries. Kept for scripts;
@@ -1198,8 +1212,21 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
             json,
         ),
         Some(Commands::Gc {
+            until_free: Some(size),
+            free_path: Some(path),
+            ..
+        }) => {
+            let free_bytes = config::parse_size(&size).ok_or_else(|| {
+                machine::invalid_arguments(format!(
+                    "invalid --until-free {size:?}; expected a size like 100G or 512M"
+                ))
+            })?;
+            cli::gc_until_free(&config, &cli::FreeSpaceTarget { path, free_bytes }, json)
+        }
+        Some(Commands::Gc {
             max_age,
             stale_schema,
+            ..
         }) => {
             let hours = max_age
                 .as_deref()

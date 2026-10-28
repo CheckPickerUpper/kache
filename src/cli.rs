@@ -4688,6 +4688,141 @@ pub fn gc(
     Ok(())
 }
 
+/// `kache gc --until-free`: the free space the caller needs on the volume
+/// holding `path`.
+pub struct FreeSpaceTarget {
+    pub path: std::path::PathBuf,
+    pub free_bytes: u64,
+}
+
+/// Why an oldest-first sweep toward a free-space target ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FreeSpaceStop {
+    /// The volume reported at least the target free.
+    TargetReached,
+    /// Every eligible entry was tried and the target is still unmet: what is
+    /// left is recently used, protected, or still linked from a target
+    /// directory, so evicting it would free nothing.
+    NothingLeftToEvict,
+    /// The volume stopped answering `statvfs` during the sweep; eviction
+    /// stopped rather than continue without a measurement.
+    VolumeUnreadable,
+}
+
+/// Whether a free-space reading ends the sweep, and why. An unreadable
+/// volume ends it: eviction never continues blind.
+fn free_space_stop(target: u64, reading: Option<kache_fs::VolumeUsage>) -> Option<FreeSpaceStop> {
+    match reading {
+        None => Some(FreeSpaceStop::VolumeUnreadable),
+        Some(usage) if usage.free >= target => Some(FreeSpaceStop::TargetReached),
+        Some(_) => None,
+    }
+}
+
+/// Evict entries oldest first, under the GC lock, until the volume holding
+/// `target.path` has `target.free_bytes` free or nothing eligible is left.
+/// Store bytes removed and free space gained are reported apart: an entry
+/// whose blobs a target directory still links frees store bytes only when
+/// that link goes, and Kache keeps such entries rather than evict for nothing.
+/// Only the main store is swept; `[cache.volumes]` shards are not.
+pub fn gc_until_free(config: &Config, target: &FreeSpaceTarget, json: bool) -> Result<()> {
+    let read_free = || {
+        kache_fs::volume_usage(&target.path)
+            .map(|usage| usage.free)
+            .with_context(|| format!("reading free space on {}", target.path.display()))
+    };
+    read_free()?;
+    let store = Store::open(config)?;
+    let waited = std::time::Instant::now();
+    let gc_lock = store.acquire_gc_lock()?;
+    let lock_wait_ms = waited.elapsed().as_millis() as u64;
+    // Measured under the lock, so space another GC freed while this one
+    // waited is not counted as this sweep's.
+    let free_before = read_free()?;
+    let started = std::time::Instant::now();
+    let mut stop = None;
+    let mut stats = store.evict_oldest_first(|| {
+        stop = free_space_stop(target.free_bytes, kache_fs::volume_usage(&target.path));
+        stop.is_some()
+    })?;
+    stats.duration_ms = started.elapsed().as_millis() as u64;
+    drop(gc_lock);
+    record_manual_gc_run(config, &stats);
+    let reading_after = kache_fs::volume_usage(&target.path);
+    let free_after = reading_after.map(|usage| usage.free);
+    let stop = match stop {
+        Some(FreeSpaceStop::VolumeUnreadable) => FreeSpaceStop::VolumeUnreadable,
+        _ => free_space_stop(target.free_bytes, reading_after)
+            .unwrap_or(FreeSpaceStop::NothingLeftToEvict),
+    };
+    let free_bytes_gained = free_after.map(|free| free.saturating_sub(free_before));
+
+    if json {
+        #[derive(serde::Serialize)]
+        struct Body<'a> {
+            stop: FreeSpaceStop,
+            free_path: std::borrow::Cow<'a, str>,
+            target_free_bytes: u64,
+            free_bytes_before: u64,
+            free_bytes_after: Option<u64>,
+            free_bytes_gained: Option<u64>,
+            entries_dropped: usize,
+            store_bytes_removed: u64,
+            disk_bytes_reclaimed: u64,
+            entries_pinned: usize,
+            entries_unreclaimable: usize,
+            entries_failed: usize,
+            duration_ms: u64,
+            lock_wait_ms: u64,
+        }
+        return crate::machine::emit(
+            crate::machine::command(),
+            Body {
+                stop,
+                free_path: target.path.to_string_lossy(),
+                target_free_bytes: target.free_bytes,
+                free_bytes_before: free_before,
+                free_bytes_after: free_after,
+                free_bytes_gained,
+                entries_dropped: stats.entries_evicted,
+                store_bytes_removed: stats.bytes_freed,
+                disk_bytes_reclaimed: stats.disk_bytes_reclaimed,
+                entries_pinned: stats.entries_pinned,
+                entries_unreclaimable: stats.entries_unreclaimable,
+                entries_failed: stats.entries_failed,
+                duration_ms: stats.duration_ms,
+                lock_wait_ms,
+            },
+            Vec::new(),
+        );
+    }
+
+    let after = free_after.map_or_else(
+        || "unreadable".to_string(),
+        |free| ByteSize(free).to_string(),
+    );
+    println!(
+        "Free on {}: {} -> {} (target {}).",
+        target.path.display(),
+        ByteSize(free_before),
+        after,
+        ByteSize(target.free_bytes),
+    );
+    println!("Oldest-first GC: {}", describe_eviction(&stats, false));
+    println!(
+        "{}",
+        match stop {
+            FreeSpaceStop::TargetReached => "Target reached.",
+            FreeSpaceStop::NothingLeftToEvict =>
+                "Target not reached: no eligible entry is left to evict.",
+            FreeSpaceStop::VolumeUnreadable =>
+                "Stopped: the volume's free space could not be read.",
+        }
+    );
+    Ok(())
+}
+
 /// Wipe the entire cache or entries for a specific crate.
 pub fn purge(config: &Config, crate_filter: Option<&str>) -> Result<()> {
     let store = Store::open(config)?;

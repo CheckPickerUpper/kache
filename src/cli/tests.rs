@@ -10345,3 +10345,17 @@ fn a_declined_store_is_the_latest_compile_and_a_fallback_run_is_not() {
         "{lines:?}"
     );
 }
+
+#[test]
+fn free_space_target_stops_only_on_a_reading_that_meets_it_or_none_at_all() {
+    let reading = |free| Some(kache_fs::VolumeUsage { total: 100, free });
+    assert_eq!(free_space_stop(10, reading(9)), None);
+    assert_eq!(
+        free_space_stop(10, reading(10)),
+        Some(FreeSpaceStop::TargetReached)
+    );
+    assert_eq!(
+        free_space_stop(10, None),
+        Some(FreeSpaceStop::VolumeUnreadable)
+    );
+}

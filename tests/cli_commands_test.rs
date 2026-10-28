@@ -1415,6 +1415,66 @@ fn gc_on_empty_cache_succeeds() {
 }
 
 #[test]
+fn gc_until_free_measures_the_volume_and_says_why_it_stopped() {
+    let e = env();
+    let run = |target: &str, path: &Path| {
+        let output = e
+            .cmd()
+            .args(["--json", "gc", "--until-free", target, "--free-path"])
+            .arg(path)
+            .output()
+            .unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("{error}: {output:?}"));
+        (output.status.code(), doc)
+    };
+
+    let (code, met) = run("1", &e.cache);
+    assert_eq!(code, Some(0), "{met}");
+    assert_eq!(met["stop"], "target_reached", "{met}");
+    assert_eq!(met["target_free_bytes"], 1, "{met}");
+    assert_eq!(met["free_path"], e.cache.display().to_string(), "{met}");
+    assert!(met["free_bytes_before"].as_u64().unwrap() >= 1, "{met}");
+    assert!(met["free_bytes_after"].as_u64().unwrap() >= 1, "{met}");
+    assert_eq!(met["entries_dropped"], 0, "{met}");
+
+    let (code, unmet) = run("9000000T", &e.cache);
+    assert_eq!(code, Some(0), "{unmet}");
+    assert_eq!(unmet["stop"], "nothing_left_to_evict", "{unmet}");
+    assert_eq!(
+        unmet["target_free_bytes"], 9_000_000_000_000_000_000_u64,
+        "{unmet}"
+    );
+    for field in [
+        "store_bytes_removed",
+        "disk_bytes_reclaimed",
+        "free_bytes_gained",
+        "entries_pinned",
+        "entries_unreclaimable",
+        "entries_failed",
+        "duration_ms",
+        "lock_wait_ms",
+    ] {
+        assert!(unmet[field].is_u64(), "{field}: {unmet}");
+    }
+
+    let (code, missing) = run("1", &e.cache.join("absent"));
+    assert_ne!(code, Some(0), "{missing}");
+    assert_eq!(missing["success"], false, "{missing}");
+
+    e.cmd()
+        .args(["gc", "--until-free", "1G"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--free-path"));
+    e.cmd()
+        .args(["gc", "--until-free", "lots", "--free-path"])
+        .arg(&e.cache)
+        .assert()
+        .code(2);
+}
+
+#[test]
 fn gc_rejects_overlapping_explicit_policies() {
     let e = env();
     e.cmd()

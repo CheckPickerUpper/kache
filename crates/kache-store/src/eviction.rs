@@ -281,6 +281,28 @@ impl EvictionPolicy for OlderThanPolicy {
     }
 }
 
+/// Oldest-first eviction: every entry, longest idle first, so a sweep with a
+/// free-space target removes the entries least likely to be reused before any
+/// newer one. Equal idle times fall back to the key, for a stable order.
+pub struct OldestFirstPolicy;
+
+impl EvictionPolicy for OldestFirstPolicy {
+    fn name(&self) -> &'static str {
+        "oldest-first"
+    }
+
+    fn select(&self, candidates: &[EntryFeatures]) -> Vec<String> {
+        let mut ranked: Vec<&EntryFeatures> = candidates.iter().collect();
+        ranked.sort_by(|a, b| {
+            b.idle_hours
+                .partial_cmp(&a.idle_hours)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.key.cmp(&b.key))
+        });
+        ranked.into_iter().map(|e| e.key.clone()).collect()
+    }
+}
+
 /// Content-duplicate eviction: when several committed entries share one
 /// `content_hash`, keep the most recently accessed and evict the rest —
 /// but only where removal actually frees bytes.
@@ -525,6 +547,22 @@ mod tests {
             picked,
             vec!["old"],
             "boundary entry must be kept (strict >)"
+        );
+    }
+
+    #[test]
+    fn oldest_first_ranks_every_entry_by_idle_time_longest_first() {
+        let c = vec![
+            feat("middle", 100, 9, 30.0),
+            feat("fresh", 900, 0, 0.5),
+            feat("oldest", 1, 50, 200.0),
+            feat("tie_b", 100, 0, 30.0),
+        ];
+        let picked = OldestFirstPolicy.select(&c);
+        assert_eq!(
+            picked,
+            vec!["oldest", "middle", "tie_b", "fresh"],
+            "hits and size never reorder; equal ages fall back to the key"
         );
     }
 
