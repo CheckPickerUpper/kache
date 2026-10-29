@@ -3532,6 +3532,33 @@ fn oldest_first_eviction_removes_the_longest_idle_entry_first_and_stops_when_ask
     assert_eq!(store.entry_count().unwrap(), 0);
 }
 
+/// An entry a target directory still links frees nothing when evicted, and
+/// the oldest-first sweep learns that from its read-only probe. It used to
+/// take the index write lock for each such entry, behind every build's
+/// write and paced like a removal: 31,381 of them kept `kache gc
+/// --until-free` running for 18 minutes on one store.
+#[test]
+fn oldest_first_eviction_skips_entries_a_target_links_without_the_write_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = u64::MAX;
+    let store = Store::open(&config).unwrap();
+    let held_blob = put_idle_entry(&store, dir.path(), "held", 200);
+    std::fs::hard_link(&held_blob, dir.path().join("target-copy.rlib")).unwrap();
+    store.db.busy_timeout(Duration::from_millis(50)).unwrap();
+    let blocker = Connection::open(config.index_db_path()).unwrap();
+    blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+    let stats = store.evict_oldest_first(|| false).unwrap();
+    blocker.execute_batch("ROLLBACK").unwrap();
+
+    assert_eq!(stats.entries_unreclaimable, 1, "{stats:?}");
+    assert_eq!(stats.bytes_held, 200, "{stats:?}");
+    assert_eq!(stats.entries_failed, 0, "{stats:?}");
+    assert_eq!(stats.entries_locked, 0, "{stats:?}");
+    assert!(store.contains("held"));
+}
+
 #[test]
 fn evict_counts_lock_contention_apart_from_bad_data() {
     let dir = tempfile::tempdir().unwrap();
