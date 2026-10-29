@@ -4693,6 +4693,9 @@ pub fn gc(
 pub struct FreeSpaceTarget {
     pub path: std::path::PathBuf,
     pub free_bytes: u64,
+    /// How long the sweep may take, its wait for `gc.lock` included.
+    /// `None` waits for the lock and walks until the target or the end.
+    pub within: Option<std::time::Duration>,
 }
 
 /// Why an oldest-first sweep toward a free-space target ended.
@@ -4708,6 +4711,27 @@ enum FreeSpaceStop {
     /// The volume stopped answering `statvfs` during the sweep; eviction
     /// stopped rather than continue without a measurement.
     VolumeUnreadable,
+    /// `--within` ran out before the target was reached, while waiting for
+    /// another GC's lock or between removals.
+    DeadlineReached,
+}
+
+/// Poll for `gc.lock` until `deadline`; `None` when another GC still holds
+/// it then.
+fn gc_lock_before(
+    store: &Store,
+    deadline: std::time::Instant,
+) -> Result<Option<crate::store::GcLock>> {
+    loop {
+        if let Some(lock) = store.try_gc_lock()? {
+            return Ok(Some(lock));
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Ok(None);
+        }
+        std::thread::sleep(left.min(std::time::Duration::from_millis(250)));
+    }
 }
 
 /// Whether a free-space reading ends the sweep, and why. An unreadable
@@ -4735,24 +4759,43 @@ pub fn gc_until_free(config: &Config, target: &FreeSpaceTarget, json: bool) -> R
     read_free()?;
     let store = Store::open(config)?;
     let waited = std::time::Instant::now();
-    let gc_lock = store.acquire_gc_lock()?;
+    let deadline = target.within.map(|within| waited + within);
+    let gc_lock = match deadline {
+        None => Some(store.acquire_gc_lock()?),
+        Some(deadline) => gc_lock_before(&store, deadline)?,
+    };
     let lock_wait_ms = waited.elapsed().as_millis() as u64;
     // Measured under the lock, so space another GC freed while this one
     // waited is not counted as this sweep's.
     let free_before = read_free()?;
     let started = std::time::Instant::now();
     let mut stop = None;
-    let mut stats = store.evict_oldest_first(|| {
-        stop = free_space_stop(target.free_bytes, kache_fs::volume_usage(&target.path));
-        stop.is_some()
-    })?;
+    let mut stats = match gc_lock {
+        Some(_) => store.evict_oldest_first(|| {
+            stop = free_space_stop(target.free_bytes, kache_fs::volume_usage(&target.path))
+                .or_else(|| {
+                    deadline
+                        .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                        .then_some(FreeSpaceStop::DeadlineReached)
+                });
+            stop.is_some()
+        })?,
+        None => {
+            stop = Some(FreeSpaceStop::DeadlineReached);
+            crate::store::GcStats::default()
+        }
+    };
     stats.duration_ms = started.elapsed().as_millis() as u64;
-    drop(gc_lock);
-    record_manual_gc_run(config, &stats);
+    if let Some(lock) = gc_lock {
+        drop(lock);
+        record_manual_gc_run(config, &stats);
+    }
     let reading_after = kache_fs::volume_usage(&target.path);
     let free_after = reading_after.map(|usage| usage.free);
     let stop = match stop {
         Some(FreeSpaceStop::VolumeUnreadable) => FreeSpaceStop::VolumeUnreadable,
+        Some(FreeSpaceStop::DeadlineReached) => free_space_stop(target.free_bytes, reading_after)
+            .unwrap_or(FreeSpaceStop::DeadlineReached),
         _ => free_space_stop(target.free_bytes, reading_after)
             .unwrap_or(FreeSpaceStop::NothingLeftToEvict),
     };
@@ -4818,6 +4861,7 @@ pub fn gc_until_free(config: &Config, target: &FreeSpaceTarget, json: bool) -> R
                 "Target not reached: no eligible entry is left to evict.",
             FreeSpaceStop::VolumeUnreadable =>
                 "Stopped: the volume's free space could not be read.",
+            FreeSpaceStop::DeadlineReached => "Target not reached: --within ran out before it.",
         }
     );
     Ok(())

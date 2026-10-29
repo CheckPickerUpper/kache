@@ -1474,6 +1474,54 @@ fn gc_until_free_measures_the_volume_and_says_why_it_stopped() {
         .code(2);
 }
 
+/// A caller with its own time limit gives the sweep `--within`; the sweep
+/// ends itself by then, also while another GC holds the lock, and says so
+/// in its result instead of being killed with no result at all.
+#[test]
+fn gc_until_free_ends_itself_within_the_given_seconds() {
+    let e = env();
+    let run = |within: &str| {
+        let output = e
+            .cmd()
+            .args([
+                "--json",
+                "gc",
+                "--until-free",
+                "9000000T",
+                "--within",
+                within,
+                "--free-path",
+            ])
+            .arg(&e.cache)
+            .output()
+            .unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("{error}: {output:?}"));
+        (output.status.code(), doc)
+    };
+
+    let (code, spent) = run("0");
+    assert_eq!(code, Some(0), "{spent}");
+    assert_eq!(spent["stop"], "deadline_reached", "{spent}");
+    assert_eq!(spent["entries_dropped"], 0, "{spent}");
+
+    let store = e.cache.join("store");
+    std::fs::create_dir_all(&store).unwrap();
+    let holder = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(store.join("gc.lock"))
+        .unwrap();
+    holder.lock().unwrap();
+    let (code, locked) = run("1");
+    drop(holder);
+    assert_eq!(code, Some(0), "{locked}");
+    assert_eq!(locked["stop"], "deadline_reached", "{locked}");
+    assert!(locked["lock_wait_ms"].as_u64().unwrap() >= 1000, "{locked}");
+    assert_eq!(locked["entries_dropped"], 0, "{locked}");
+}
+
 #[test]
 fn gc_rejects_overlapping_explicit_policies() {
     let e = env();
