@@ -16741,3 +16741,30 @@ fn environment_detail_hashes_follow_the_normalized_key_inputs() {
     assert_ne!(first["BUILD_MODE"], second["BUILD_MODE"]);
     assert!(hashed(Vec::new()).is_empty());
 }
+
+#[cfg(unix)]
+#[test]
+fn linker_version_probe_leaves_the_build_folder_untouched() {
+    // `zig cc --version` for a Darwin target creates an empty `a.o` in its
+    // working folder; the probe must not hand it the build's folder.
+    let dir = tempfile::tempdir().unwrap();
+    let linker = dir.path().join("cc");
+    let written = format!("kache-linker-probe-{}.o", std::process::id());
+    kache_fs::testutil::write_executable(
+        &linker,
+        format!("#!/bin/sh\n: > '{written}'\necho 'fake-ld 1.0'\necho second line\n"),
+    );
+    let build_folder = std::env::current_dir().unwrap();
+    let leftover = build_folder.join(&written);
+
+    let banner = linker_version_banner(&linker);
+    let left_behind = leftover.exists();
+    let _ = std::fs::remove_file(&leftover);
+
+    assert_eq!(banner.as_deref(), Some("fake-ld 1.0"));
+    assert!(
+        !left_behind,
+        "the linker probe wrote {written} into the build folder {}",
+        build_folder.display()
+    );
+}

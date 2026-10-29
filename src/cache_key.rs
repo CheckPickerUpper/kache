@@ -9784,15 +9784,27 @@ fn get_linker_identity(args: &RustcArgs) -> Option<String> {
         return Some(cached);
     }
 
-    let output = std::process::Command::new(linker)
-        .arg("--version")
-        .output()
-        .ok()?;
-
-    let version = String::from_utf8_lossy(&output.stdout);
-    let first_line = version.lines().next()?.to_string();
+    let first_line = linker_version_banner(&std::path::absolute(&resolved).ok()?)?;
     write_tool_version_cache(&resolved, "linker-ver", &first_line);
     Some(first_line)
+}
+
+/// The first line `linker --version` prints, run in an empty scratch folder.
+///
+/// Only standard output is read, and some drivers write files even for
+/// `--version`: `zig cc` for a Darwin target creates an empty `a.o` in its
+/// working folder. Run in the build's folder, that file is left in the user's
+/// checkout. `linker` must be absolute so the change of folder cannot change
+/// which program runs.
+fn linker_version_banner(linker: &Path) -> Option<String> {
+    let scratch = tempfile::tempdir().ok()?;
+    let output = std::process::Command::new(linker)
+        .arg("--version")
+        .current_dir(scratch.path())
+        .output()
+        .ok()?;
+    let version = String::from_utf8_lossy(&output.stdout);
+    Some(version.lines().next()?.to_string())
 }
 
 /// Resolve a bare command name to a full path by searching PATH.
