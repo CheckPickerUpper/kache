@@ -11200,10 +11200,18 @@ pub(crate) fn get_linker_identity_for(args: &RustcArgs, env: &InvocationEnv) -> 
         return Some(cached);
     }
 
+    // Only standard output is read, and some drivers write files even for
+    // `--version`: `zig cc` for a Darwin target creates an empty `a.o` in its
+    // working folder. Run in the client's folder, that file is left in the
+    // user's checkout, so the probe runs in an empty scratch folder instead.
+    // `resolved` is absolute, so the change of folder cannot change which
+    // program runs.
+    let scratch = tempfile::tempdir_in(env.temp_dir()).ok()?;
     let output = env
         .command(&resolved)
         .ok()?
         .arg("--version")
+        .current_dir(scratch.path())
         .invocation_output()
         .ok()?;
 

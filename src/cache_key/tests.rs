@@ -19882,3 +19882,45 @@ fn out_dir_include_spellings_share_one_collapsed_fingerprint() {
         "a crate-relative dotted spelling stays as rustc recorded it"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn linker_version_probe_leaves_the_build_folder_untouched() {
+    // `zig cc --version` for a Darwin target creates an empty `a.o` in its
+    // working folder; the probe must not hand it the build's folder.
+    let dir = tempfile::tempdir().unwrap();
+    let build = dir.path().join("build");
+    std::fs::create_dir(&build).unwrap();
+    let linker = dir.path().join("cc");
+    kache_fs::testutil::write_executable(
+        &linker,
+        "#!/bin/sh\n: > a.o\necho 'fake-ld 1.0'\necho second line\n",
+    );
+    let cache = dir.path().join("cache");
+    let env = InvocationEnv::from_parts(
+        [("KACHE_CACHE_DIR", cache.as_os_str())],
+        Some(build.clone()),
+        None,
+        dir.path().to_path_buf(),
+    );
+    let argv: Vec<String> = [
+        "rustc",
+        "--crate-name",
+        "probe",
+        "--crate-type",
+        "bin",
+        "src/main.rs",
+        "-C",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .chain([format!("linker={}", linker.display())])
+    .collect();
+    let args = RustcArgs::parse_for(&argv, &env).unwrap();
+
+    assert_eq!(
+        get_linker_identity_for(&args, &env).as_deref(),
+        Some("fake-ld 1.0")
+    );
+    assert_eq!(std::fs::read_dir(&build).unwrap().count(), 0);
+}
