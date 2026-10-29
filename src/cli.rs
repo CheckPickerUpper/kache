@@ -5772,7 +5772,7 @@ fn clean_with_terminal(
             waiting_for: waiting
                 .iter()
                 .map(|holder| WaitingFor {
-                    pid: holder.pid,
+                    pid: holder.process.pid(),
                     command: holder.what.clone(),
                     running_seconds: now.saturating_sub(holder.since),
                 })
@@ -6097,7 +6097,7 @@ fn held_reason(holders: &[crate::target_use::Holder], now: u64) -> String {
             format!(
                 "`{}` (pid {}, running {})",
                 holder.what,
-                holder.pid,
+                holder.process.pid(),
                 term::duration_ms(running)
             )
         })
