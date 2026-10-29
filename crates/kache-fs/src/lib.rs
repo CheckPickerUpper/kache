@@ -421,6 +421,8 @@ fn walk(
 }
 
 /// Free and total bytes on the volume holding a path.
+/// Free bytes are available to the calling user. On Windows, the total also
+/// reflects any per-user quota.
 ///
 /// This is the ground truth a reclaim is ultimately graded against: predicted
 /// bytes versus the actual `statvfs` delta. Expect the two to differ — on APFS
@@ -448,6 +450,8 @@ impl VolumeUsage {
 }
 
 /// Volume usage for the filesystem holding `path`.
+/// The path must exist and, on Windows, must be a directory. Empty paths,
+/// embedded NULs, failed probes and unsupported platforms return `None`.
 pub fn volume_usage(path: &Path) -> Option<VolumeUsage> {
     #[cfg(any(test, feature = "testing"))]
     if let Some(usage) = testutil::mock_volume_usage(path) {
@@ -457,11 +461,27 @@ pub fn volume_usage(path: &Path) -> Option<VolumeUsage> {
     {
         volume_usage_unix(path)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        volume_usage_windows(path)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = path;
         None
     }
+}
+
+/// Query an existing Windows directory with `GetDiskFreeSpaceExW`.
+#[cfg(windows)]
+fn volume_usage_windows(path: &Path) -> Option<VolumeUsage> {
+    use std::os::windows::ffi::OsStrExt;
+    // Reject empty names and embedded NULs instead of querying an unintended path.
+    let mut wide = path.as_os_str().encode_wide();
+    if path.as_os_str().is_empty() || wide.any(|unit| unit == 0) {
+        return None;
+    }
+    capacity::volume_space(path)
 }
 
 #[cfg(unix)]
@@ -868,7 +888,7 @@ mod tests {
         assert_eq!(blocks.free, 16384);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn volume_query_requires_a_real_path() {
         let dir = TempDir::new("volume-usage");
@@ -877,14 +897,17 @@ mod tests {
         assert!(usage.free > 0);
         assert!(usage.free <= usage.total);
         assert!(volume_usage(&dir.path().join("missing")).is_none());
+        assert!(volume_usage(Path::new("")).is_none());
         assert!(volume_usage(Path::new("\0")).is_none());
+        let mut truncated = dir.path().as_os_str().to_owned();
+        truncated.push("\0ignored");
+        assert!(volume_usage(Path::new(&truncated)).is_none());
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     #[test]
     fn unavailable_volume_usage_remains_unknown() {
-        let dir = TempDir::new("volume-usage");
-        assert!(volume_usage(dir.path()).is_none());
+        assert!(volume_usage(Path::new(".")).is_none());
     }
 
     #[test]
