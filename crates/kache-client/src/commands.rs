@@ -57,6 +57,11 @@ enum Commands {
         /// The directory whose volume --until-free measures
         #[arg(long, value_name = "DIR", requires = "until_free")]
         free_path: Option<PathBuf>,
+
+        /// End the --until-free sweep within this many seconds, counting
+        /// any wait for another GC's lock; it stops between removals
+        #[arg(long, value_name = "SECONDS", requires = "until_free")]
+        within: Option<u64>,
     },
 
     /// Remove the whole cache or one crate's entries. Kept for scripts;

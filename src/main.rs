@@ -870,6 +870,7 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
         Some(Commands::Gc {
             until_free: Some(size),
             free_path: Some(path),
+            within,
             ..
         }) => {
             let free_bytes = config::parse_size(&size).ok_or_else(|| {
@@ -877,7 +878,12 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
                     "invalid --until-free {size:?}; expected a size like 100G or 512M"
                 ))
             })?;
-            cli::gc_until_free(&config, &cli::FreeSpaceTarget { path, free_bytes }, json)
+            let target = cli::FreeSpaceTarget {
+                path,
+                free_bytes,
+                within: within.map(std::time::Duration::from_secs),
+            };
+            cli::gc_until_free(&config, &target, json)
         }
         Some(Commands::Gc {
             max_age,
