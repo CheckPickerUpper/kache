@@ -868,10 +868,23 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
             json,
         ),
         Some(Commands::Gc {
+            until_free: Some(size),
+            free_path: Some(path),
+            ..
+        }) => {
+            let free_bytes = config::parse_size(&size).ok_or_else(|| {
+                machine::invalid_arguments(format!(
+                    "invalid --until-free {size:?}; expected a size like 100G or 512M"
+                ))
+            })?;
+            cli::gc_until_free(&config, &cli::FreeSpaceTarget { path, free_bytes }, json)
+        }
+        Some(Commands::Gc {
             max_age,
             stale_schema,
             rustc_version,
             dry_run,
+            ..
         }) => {
             if let Some(version) = rustc_version {
                 return cli::compiler_gc::clean(&config, &version, dry_run, true, json, "gc");

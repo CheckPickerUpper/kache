@@ -153,6 +153,12 @@ Eviction flushes any entries still pending durability before it judges them (see
 
 `kache gc` (evict by the size and age limits now, as the daemon does), `kache purge` and `kache targets` still work as they did, for scripts written before `clean` took them over. They are hidden from `--help`.
 
+```bash
+kache gc --until-free 100G --free-path ~/build
+```
+
+`--until-free SIZE --free-path DIR` evicts entries longest idle first until the volume holding `DIR` has `SIZE` free. It holds `gc.lock`, reads the volume's free space after it takes the lock and after each removal, and stops as soon as the target is met. Recently used entries, entries awaiting upload and entries a target directory still links are kept, so the target can stay out of reach. The result says why the sweep stopped: `target_reached`, `nothing_left_to_evict`, or `volume_unreadable` when the volume stops answering. `--json` also reports the free bytes before and after, store bytes removed apart from disk bytes reclaimed, and the time spent waiting for the lock and sweeping. It sweeps only the main store.
+
 GC also recovers rebuild costs for older cache entries over successive runs. A pass that recovers no positive costs may still leave pending work. Metadata that cannot be read is retried later.
 
 ### Sharing target files

@@ -11663,3 +11663,17 @@ fn compact_stats_label_scheduler_evidence_as_recorded_history() {
     assert_eq!(legacy.total_flight_wait_ms, 0);
     assert_eq!(legacy.total_permit_wait_ms, 0);
 }
+
+#[test]
+fn free_space_target_stops_only_on_a_reading_that_meets_it_or_none_at_all() {
+    let reading = |free| Some(kache_fs::VolumeUsage { total: 100, free });
+    assert_eq!(free_space_stop(10, reading(9)), None);
+    assert_eq!(
+        free_space_stop(10, reading(10)),
+        Some(FreeSpaceStop::TargetReached)
+    );
+    assert_eq!(
+        free_space_stop(10, None),
+        Some(FreeSpaceStop::VolumeUnreadable)
+    );
+}

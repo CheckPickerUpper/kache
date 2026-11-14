@@ -4838,6 +4838,94 @@ fn disk_pressure_stops_before_scanning_and_between_removals_below_the_size_budge
 }
 
 #[test]
+fn oldest_first_eviction_removes_the_longest_idle_entry_first_and_stops_when_asked() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = u64::MAX;
+    let store = Store::open(&config).unwrap();
+    for (fill, (key, age)) in [
+        ("recent", "-1 hours"),
+        ("oldest", "-30 hours"),
+        ("older", "-5 hours"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let output_file = dir.path().join(format!("{key}.rlib"));
+        std::fs::write(&output_file, vec![fill as u8; 200]).unwrap();
+        store
+            .put(
+                key,
+                key,
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(output_file.clone(), format!("lib{key}.rlib"))],
+                "",
+                "",
+            )
+            .unwrap();
+        store.remove_clone_for_test(&output_file);
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', ?2) WHERE cache_key = ?1",
+                params![key, age],
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        store.evict_oldest_first(|| true).unwrap().entries_evicted,
+        0,
+        "a target already met evicts nothing"
+    );
+
+    let mut checks = 0;
+    let stats = store
+        .evict_oldest_first(|| {
+            checks += 1;
+            checks >= 3
+        })
+        .unwrap();
+    assert_eq!(stats.entries_evicted, 1, "{stats:?}");
+    assert!(stats.bytes_freed > 0, "{stats:?}");
+    assert!(!store.contains("oldest"));
+    assert!(store.contains("older") && store.contains("recent"));
+
+    let rest = store.evict_oldest_first(|| false).unwrap();
+    assert_eq!(rest.entries_evicted, 2, "{rest:?}");
+    assert_eq!(store.entry_count().unwrap(), 0);
+}
+
+/// An entry a target directory still links frees nothing when evicted, and
+/// the oldest-first sweep learns that from its read-only probe. It used to
+/// take the index write lock for each such entry, behind every build's
+/// write and paced like a removal: 31,381 of them kept `kache gc
+/// --until-free` running for 18 minutes on one store.
+#[test]
+fn oldest_first_eviction_skips_entries_a_target_links_without_the_write_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = u64::MAX;
+    let store = Store::open(&config).unwrap();
+    let held_blob = put_idle_entry(&store, dir.path(), "held", 200);
+    std::fs::hard_link(&held_blob, dir.path().join("target-copy.rlib")).unwrap();
+    store.db.busy_timeout(Duration::from_millis(50)).unwrap();
+    let blocker = Connection::open(config.index_db_path()).unwrap();
+    blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+    let stats = store.evict_oldest_first(|| false).unwrap();
+    blocker.execute_batch("ROLLBACK").unwrap();
+
+    assert_eq!(stats.entries_unreclaimable, 1, "{stats:?}");
+    assert_eq!(stats.bytes_held, 200, "{stats:?}");
+    assert_eq!(stats.entries_failed, 0, "{stats:?}");
+    assert_eq!(stats.entries_locked, 0, "{stats:?}");
+    assert!(store.contains("held"));
+}
+
+#[test]
 fn evict_counts_lock_contention_apart_from_bad_data() {
     let dir = tempfile::tempdir().unwrap();
     let (store, config) = store_with_one_evictable_entry(dir.path(), "busy");

@@ -5658,18 +5658,49 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// holds `gc.lock` and stops on measured free space or a work deadline.
     /// Recent accesses, imports, upload intents and external retainers keep
     /// the same protection as other automatic sweeps.
-    pub fn evict_for_disk_pressure(&self, mut stop: impl FnMut() -> bool) -> Result<GcStats> {
+    pub fn evict_for_disk_pressure(&self, stop: impl FnMut() -> bool) -> Result<GcStats> {
+        // No held-bytes probe: its walk of every last-reference blob would
+        // spend the few seconds this sweep gets before its first removal.
+        self.evict_until(
+            &crate::eviction::SizePressurePolicy,
+            SweepOrigin::Automatic,
+            false,
+            stop,
+        )
+    }
+
+    /// Evict entries oldest first until `stop` says enough. The caller holds
+    /// `gc.lock` and stops on a measured free-space target. Recent accesses,
+    /// upload intents and entries still linked from a target directory keep
+    /// their usual protection; a requested sweep does not pin imports.
+    ///
+    /// Entries a target directory still links are found by one read-only
+    /// probe and skipped, as the size sweep skips them: removing each would
+    /// take the index write lock, wait behind every build's write and be
+    /// paced like a removal, only to free nothing.
+    pub fn evict_oldest_first(&self, stop: impl FnMut() -> bool) -> Result<GcStats> {
+        self.evict_until(
+            &crate::eviction::OldestFirstPolicy,
+            SweepOrigin::Requested,
+            true,
+            stop,
+        )
+    }
+
+    /// Walk `policy`'s whole order, checking `stop` before scanning and
+    /// between removals: the sweep a measured free-space target drives.
+    fn evict_until(
+        &self,
+        policy: &dyn crate::eviction::EvictionPolicy,
+        origin: SweepOrigin,
+        probe_held_bytes: bool,
+        mut stop: impl FnMut() -> bool,
+    ) -> Result<GcStats> {
         self.refuse_write("evict")?;
         if stop() {
             return Ok(GcStats::default());
         }
-        self.evict_with_stop(
-            &crate::eviction::SizePressurePolicy,
-            None,
-            false,
-            SweepOrigin::Automatic,
-            &mut stop,
-        )
+        self.evict_with_stop(policy, None, probe_held_bytes, origin, &mut stop)
     }
 
     /// Evict entries older than the given duration.

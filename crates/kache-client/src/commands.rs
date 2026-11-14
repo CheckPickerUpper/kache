@@ -43,6 +43,20 @@ enum Commands {
         /// Remove entries from old or unrecorded cache-key schemas
         #[arg(long)]
         stale_schema: bool,
+
+        /// Evict entries oldest first until the volume holding --free-path
+        /// has this much free space (e.g. 100G)
+        #[arg(
+            long,
+            value_name = "SIZE",
+            requires = "free_path",
+            conflicts_with_all = ["max_age", "stale_schema", "rustc_version"]
+        )]
+        until_free: Option<String>,
+
+        /// The directory whose volume --until-free measures
+        #[arg(long, value_name = "DIR", requires = "until_free")]
+        free_path: Option<PathBuf>,
     },
 
     /// Remove the whole cache or one crate's entries. Kept for scripts;
