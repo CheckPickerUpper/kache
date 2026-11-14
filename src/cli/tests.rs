@@ -11677,3 +11677,20 @@ fn free_space_target_stops_only_on_a_reading_that_meets_it_or_none_at_all() {
         Some(FreeSpaceStop::VolumeUnreadable)
     );
 }
+
+#[test]
+fn a_sweep_that_lost_its_volume_says_so_even_once_the_volume_answers_again() {
+    let reading = |free| Some(kache_fs::VolumeUsage { total: 100, free });
+    assert_eq!(
+        free_space_sweep_end(Some(FreeSpaceStop::VolumeUnreadable), 10, reading(50)),
+        FreeSpaceStop::VolumeUnreadable
+    );
+    assert_eq!(
+        free_space_sweep_end(Some(FreeSpaceStop::DeadlineReached), 10, reading(9)),
+        FreeSpaceStop::DeadlineReached
+    );
+    assert_eq!(
+        free_space_sweep_end(None, 10, reading(9)),
+        FreeSpaceStop::NothingLeftToEvict
+    );
+}

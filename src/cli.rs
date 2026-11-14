@@ -4831,6 +4831,23 @@ fn free_space_stop(target: u64, reading: Option<kache_fs::VolumeUsage>) -> Optio
     }
 }
 
+/// Why a sweep ended, from the stop it saw while sweeping and the reading
+/// taken after it. A sweep that stopped on an unreadable volume reports that
+/// even when the volume answers again, because it never tried the rest.
+fn free_space_sweep_end(
+    during: Option<FreeSpaceStop>,
+    target: u64,
+    after: Option<kache_fs::VolumeUsage>,
+) -> FreeSpaceStop {
+    match during {
+        Some(FreeSpaceStop::VolumeUnreadable) => FreeSpaceStop::VolumeUnreadable,
+        Some(FreeSpaceStop::DeadlineReached) => {
+            free_space_stop(target, after).unwrap_or(FreeSpaceStop::DeadlineReached)
+        }
+        _ => free_space_stop(target, after).unwrap_or(FreeSpaceStop::NothingLeftToEvict),
+    }
+}
+
 /// Evict entries oldest first, under the GC lock, until the volume holding
 /// `target.path` has `target.free_bytes` free or nothing eligible is left.
 /// Store bytes removed and free space gained are reported apart: an entry
@@ -4879,13 +4896,7 @@ pub fn gc_until_free(config: &Config, target: &FreeSpaceTarget, json: bool) -> R
     }
     let reading_after = kache_fs::volume_usage(&target.path);
     let free_after = reading_after.map(|usage| usage.free);
-    let stop = match stop {
-        Some(FreeSpaceStop::VolumeUnreadable) => FreeSpaceStop::VolumeUnreadable,
-        Some(FreeSpaceStop::DeadlineReached) => free_space_stop(target.free_bytes, reading_after)
-            .unwrap_or(FreeSpaceStop::DeadlineReached),
-        _ => free_space_stop(target.free_bytes, reading_after)
-            .unwrap_or(FreeSpaceStop::NothingLeftToEvict),
-    };
+    let stop = free_space_sweep_end(stop, target.free_bytes, reading_after);
     let free_bytes_gained = free_after.map(|free| free.saturating_sub(free_before));
 
     if json {

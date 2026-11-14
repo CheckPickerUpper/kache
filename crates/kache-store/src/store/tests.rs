@@ -4892,6 +4892,15 @@ fn oldest_first_eviction_removes_the_longest_idle_entry_first_and_stops_when_ask
     assert!(stats.bytes_freed > 0, "{stats:?}");
     assert!(!store.contains("oldest"));
     assert!(store.contains("older") && store.contains("recent"));
+    let policy: String = store
+        .db
+        .query_row(
+            "SELECT policy FROM eviction_tombstones WHERE cache_key = 'oldest'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(policy, "oldest-first", "records which policy chose it");
 
     let rest = store.evict_oldest_first(|| false).unwrap();
     assert_eq!(rest.entries_evicted, 2, "{rest:?}");
